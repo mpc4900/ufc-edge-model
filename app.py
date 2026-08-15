@@ -17,6 +17,7 @@ from excel_report import build_excel
 from model_engine import (
     analyze_card,
     discover_card,
+    discover_event_options,
     fetch_market_rows,
     load_assets,
     realized_metrics,
@@ -40,6 +41,11 @@ def assets():
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_card(event_search, refresh_results=False):
     return discover_card(event_search, refresh_results=refresh_results)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_event_options():
+    return discover_event_options()
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -109,15 +115,16 @@ st.markdown("""
   .brand small { display:block; margin-top:.18rem; color:#95a9bd; font-size:.52rem; letter-spacing:.16em; }
   .model-pill { border:1px solid #344d66; border-radius:999px; padding:.48rem .76rem; color:#bdcada; font-size:.62rem; letter-spacing:.08em; text-transform:uppercase; }
   .model-pill i { width:7px; height:7px; display:inline-block; border-radius:50%; background:#26b68b; margin-right:.42rem; }
-  .hero { display:flex; align-items:flex-end; justify-content:space-between; gap:2rem; margin-bottom:1.7rem; }
-  .hero p { margin:0 0 .48rem; color:#1c4d77; font-size:.62rem; font-weight:800; letter-spacing:.17em; }
-  .hero h1 { margin:0; max-width:800px; font-size:clamp(2.2rem,4.4vw,3.7rem); line-height:1; letter-spacing:-.05em; }
-  .hero span { display:block; margin-top:.85rem; color:#667587; font-size:.9rem; }
+  .hero { min-height:190px; display:grid; grid-template-columns:minmax(0,1fr) 175px; align-items:center; gap:3rem; margin-bottom:1.35rem; }
+  .hero-copy { min-width:0; }
+  .hero .eyebrow { display:block; margin:0 0 .75rem; color:#1c4d77; font-size:.62rem; font-weight:800; letter-spacing:.17em; }
+  .hero h1 { position:static; display:block; margin:0; max-width:850px; color:#0a192d; font-size:clamp(2.15rem,4.1vw,3.55rem); line-height:1.02; letter-spacing:-.045em; }
+  .hero .hero-sub { display:block; margin-top:1rem; color:#667587; font-size:.9rem; line-height:1.45; }
   .holdout { min-width:155px; border-left:3px solid #08745a; padding:.3rem 0 .3rem 1rem; }
-  .holdout span { margin:0; font-size:.55rem; font-weight:800; letter-spacing:.12em; }
+  .holdout span { display:block; margin:0; font-size:.55rem; font-weight:800; letter-spacing:.12em; }
   .holdout b { display:block; margin:.15rem 0; font-size:1.7rem; }
   .holdout small { color:#667587; font-size:.58rem; }
-  div[data-testid="stTextInput"] label p, div[data-testid="stNumberInput"] label p { color:#667587; font-size:.58rem; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+  div[data-testid="stTextInput"] label p, div[data-testid="stNumberInput"] label p, div[data-testid="stSelectbox"] label p { color:#667587; font-size:.58rem; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
   .stTextInput input, .stNumberInput input { background:#fff; border-color:#cbd5df; }
   .stButton button { height:2.7rem; border:0; border-radius:0; background:#0a192d; color:#fff; font-size:.66rem; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
   .stButton button:hover { background:#1c4d77; color:#fff; }
@@ -149,7 +156,7 @@ st.markdown("""
   .formula-row { display:grid; grid-template-columns:135px 1fr; gap:1rem; padding:.65rem 0; border-top:1px solid #d6dee7; font-size:.7rem; }
   .formula-row span { color:#667587; }
   .fineprint { margin-top:1.6rem; color:#7b8998; font-size:.62rem; }
-  @media(max-width:700px){.block-container{padding:1rem}.brandbar{margin:-1rem -1rem 1.5rem;padding:1rem}.model-pill,.holdout{display:none}.hero h1{font-size:2.4rem}}
+  @media(max-width:700px){.block-container{padding:1rem}.brandbar{margin:-1rem -1rem 1.5rem;padding:1rem}.model-pill,.holdout{display:none}.hero{display:block;min-height:0}.hero h1{font-size:2.4rem}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -158,7 +165,7 @@ st.markdown("""
 <div class="brandbar"><div class="brand"><span class="brand-mark">UE</span><div><b>UFC EDGE</b><small>CALIBRATED FIGHT PRICING</small></div></div><div class="model-pill"><i></i> Gradient boosting · cached</div></div>
 """, unsafe_allow_html=True)
 st.markdown(f"""
-<div class="hero"><div><p>UFC TRADING ENGINE</p><h1>Fair value versus the live market.</h1><span>Separate the likely winner from the best-priced trade, then define the exit before entering.</span></div><div class="holdout"><span>UNSEEN HOLDOUT</span><b>{bundle['metrics']['accuracy']:.1%}</b><small>accuracy</small></div></div>
+<div class="hero"><div class="hero-copy"><span class="eyebrow">UFC TRADING ENGINE</span><h1>Fair value versus the live market.</h1><span class="hero-sub">Separate the likely winner from the best-priced trade, then define the exit before entering.</span></div><div class="holdout"><span>UNSEEN HOLDOUT</span><b>{bundle['metrics']['accuracy']:.1%}</b><small>accuracy</small></div></div>
 """, unsafe_allow_html=True)
 
 with st.sidebar:
@@ -174,14 +181,23 @@ with st.sidebar:
     use_research = st.checkbox("Use capped research overlay", value=False)
     reports = st.file_uploader("Research reports", type=["pdf", "docx", "txt", "md", "csv"], accept_multiple_files=True, disabled=not use_research)
 
+event_options = cached_event_options()
+option_labels = [option["label"] for option in event_options] + ["CUSTOM  •  Fighter A vs Fighter B"]
+option_values = {option["label"]: option["value"] for option in event_options}
 event_col, bankroll_col, button_col = st.columns([6, 2, 2], vertical_alignment="bottom")
-event_search = event_col.text_input("Event or fight", value="UFC 330", placeholder="Example: UFC 330 or Fighter A vs Fighter B")
+selected_event = event_col.selectbox("Live & upcoming UFC events", option_labels)
 bankroll = bankroll_col.number_input("Bankroll", min_value=100, max_value=10_000_000, value=10_000, step=100)
 run = button_col.button("Refresh live prices", use_container_width=True, type="primary")
+if selected_event.startswith("CUSTOM"):
+    event_search = st.text_input("Custom matchup", placeholder="Islam Makhachev vs Ian Machado Garry").strip()
+else:
+    event_search = option_values[selected_event]
 
 if run:
     started = time.perf_counter()
     try:
+        if not event_search:
+            raise RuntimeError("Type both fighter names as Fighter A vs Fighter B.")
         with st.spinner("Refreshing card and market prices…"):
             card = cached_card(event_search, refresh_results)
             card_json = pd.DataFrame(card).to_json(orient="records")
@@ -212,7 +228,7 @@ if run:
 
 analyses = st.session_state.get("analyses")
 if not analyses:
-    st.markdown("<div class='math-card' style='text-align:center;min-height:260px;display:grid;place-items:center'><div><small>READY</small><h3>Enter tonight’s event and run the model.</h3><span style='color:#667587;font-size:.75rem'>The trained model stays loaded. Only the card and odds refresh.</span></div></div>", unsafe_allow_html=True)
+    st.markdown("<div class='math-card' style='text-align:center;min-height:240px;display:grid;place-items:center'><div><small>READY</small><h3>Choose a current UFC card above.</h3><span style='color:#667587;font-size:.75rem'>Then refresh to load its fights and live Polymarket order books.</span></div></div>", unsafe_allow_html=True)
 else:
     log = st.session_state["log"]
     market_history = st.session_state.get("market_history", pd.DataFrame())

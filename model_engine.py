@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import joblib
 import numpy as np
@@ -245,7 +246,97 @@ def parse_ufcstats_card(event):
     return bouts
 
 
+def _active_polymarket_ufc_cards():
+    """Return full UFC cards assembled from active Polymarket moneyline events."""
+    data = http_json("https://gamma-api.polymarket.com/events", params={
+        "tag_slug": "ufc", "active": "true", "closed": "false",
+        "order": "endDate", "ascending": "true", "limit": 200,
+    })
+    grouped = {}
+    eastern = ZoneInfo("America/New_York")
+    now = datetime.now(timezone.utc)
+    for event in data:
+        title = str(event.get("title") or "").strip()
+        numbered = re.match(r"^(UFC\s+\d+)\s*:", title, re.I)
+        fight_night = re.match(r"^(UFC\s+Fight\s+Night)\s*:", title, re.I)
+        if not numbered and not fight_night:
+            continue
+        for market in event.get("markets", []):
+            if str(market.get("sportsMarketType") or "").lower() != "moneyline":
+                continue
+            outcomes = [str(value).strip() for value in (parse_jsonish(market.get("outcomes"), []) or [])]
+            if len(outcomes) != 2 or set(map(canonical_name, outcomes)) == {"yes", "no"}:
+                continue
+            start = pd.to_datetime(market.get("gameStartTime") or event.get("endDate"), utc=True, errors="coerce")
+            if pd.isna(start):
+                continue
+            local_start = start.to_pydatetime().astimezone(eastern)
+            card_name = numbered.group(1).upper() if numbered else "UFC Fight Night"
+            key = f"{canonical_name(card_name)}|{local_start.date().isoformat()}"
+            group = grouped.setdefault(key, {
+                "card_name": card_name,
+                "event_date": local_start.date().isoformat(),
+                "start_utc": start.to_pydatetime(),
+                "end_utc": pd.to_datetime(event.get("endDate"), utc=True, errors="coerce"),
+                "bouts": [],
+            })
+            group["start_utc"] = min(group["start_utc"], start.to_pydatetime())
+            group["bouts"].append({
+                "event": card_name,
+                "event_date": local_start.date().isoformat(),
+                "fighter_a": outcomes[0],
+                "fighter_b": outcomes[1],
+                "winner": "",
+                "fight_url": "",
+            })
+            break
+    cards = []
+    today = now.astimezone(eastern).date()
+    for key, group in grouped.items():
+        unique = {}
+        for bout in group["bouts"]:
+            unique[pair_key(bout["fighter_a"], bout["fighter_b"])] = bout
+        group["bouts"] = list(unique.values())
+        local_date = datetime.fromisoformat(group["event_date"]).date()
+        end_value = group["end_utc"]
+        end_utc = end_value.to_pydatetime() if pd.notna(end_value) else None
+        if group["start_utc"] <= now and (end_utc is None or now <= end_utc):
+            status = "LIVE"
+        elif local_date == today:
+            status = "TODAY"
+        else:
+            status = "UPCOMING"
+        date_label = local_date.strftime("%b %-d")
+        cards.append({
+            "value": f"POLY_CARD::{key}",
+            "label": f"{status}  •  {group['card_name']}  •  {date_label}  •  {len(group['bouts'])} fights",
+            "status": status,
+            "start_utc": group["start_utc"],
+            "bouts": group["bouts"],
+        })
+    priority = {"LIVE": 0, "TODAY": 1, "UPCOMING": 2}
+    return sorted(cards, key=lambda item: (priority[item["status"]], item["start_utc"]))
+
+
+def discover_event_options():
+    """Browsable choices for the app; safe fallback keeps the app usable offline."""
+    try:
+        cards = _active_polymarket_ufc_cards()
+        if cards:
+            return [{"label": card["label"], "value": card["value"]} for card in cards]
+    except Exception:
+        pass
+    return [{"label": "UFC 330  •  Aug 15  •  12 fights", "value": "UFC 330"}]
+
+
 def discover_card(event_search: str, refresh_results: bool = False):
+    if str(event_search).startswith("POLY_CARD::"):
+        try:
+            selected = next(card for card in _active_polymarket_ufc_cards() if card["value"] == event_search)
+            if selected["bouts"]:
+                return selected["bouts"]
+        except Exception:
+            raise RuntimeError("That card is no longer active. Refresh the event list and choose another card.")
     single = re.match(r"^\s*(.+?)\s+vs\.?\s+(.+?)\s*$", event_search, re.I)
     if single:
         return [{
@@ -276,7 +367,7 @@ def discover_card(event_search: str, refresh_results: bool = False):
             card = parse_ufcstats_card(selected)
             if card:
                 return card
-    raise RuntimeError("Event not found. Enter a UFC event number or type Fighter A vs Fighter B.")
+    raise RuntimeError("Event not found. Choose a listed UFC card or type both names as Fighter A vs Fighter B.")
 
 
 def parse_jsonish(value, default=None):
