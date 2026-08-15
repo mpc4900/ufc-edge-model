@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import time
+import unicodedata
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from docx import Document
 from pypdf import PdfReader
@@ -16,8 +21,7 @@ from pypdf import PdfReader
 from excel_report import build_excel
 from model_engine import (
     analyze_card,
-    discover_card,
-    discover_event_options,
+    discover_card as engine_discover_card,
     fetch_market_rows,
     load_assets,
     realized_metrics,
@@ -33,6 +37,85 @@ STATE_DIR = Path(os.getenv("UFC_EDGE_STATE_DIR", str(ROOT / "state")))
 st.set_page_config(page_title="UFC Edge Model", page_icon="🥊", layout="wide", initial_sidebar_state="collapsed")
 
 
+def _canonical(value):
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(character for character in text if not unicodedata.combining(character))
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _json_list(value):
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def active_event_cards():
+    """Build selectable full cards from active Polymarket UFC moneylines."""
+    response = requests.get("https://gamma-api.polymarket.com/events", params={
+        "tag_slug": "ufc", "active": "true", "closed": "false",
+        "order": "endDate", "ascending": "true", "limit": 200,
+    }, timeout=8)
+    response.raise_for_status()
+    eastern = ZoneInfo("America/New_York")
+    now = datetime.now(timezone.utc)
+    groups = {}
+    for event in response.json():
+        title = str(event.get("title") or "")
+        numbered = re.match(r"^(UFC\s+\d+)\s*:", title, re.I)
+        fight_night = re.match(r"^(UFC\s+Fight\s+Night)\s*:", title, re.I)
+        if not numbered and not fight_night:
+            continue
+        for market in event.get("markets", []):
+            if str(market.get("sportsMarketType") or "").lower() != "moneyline":
+                continue
+            outcomes = [str(value).strip() for value in _json_list(market.get("outcomes"))]
+            if len(outcomes) != 2 or set(map(_canonical, outcomes)) == {"yes", "no"}:
+                continue
+            start = pd.to_datetime(market.get("gameStartTime") or event.get("endDate"), utc=True, errors="coerce")
+            if pd.isna(start):
+                continue
+            local_start = start.to_pydatetime().astimezone(eastern)
+            card_name = numbered.group(1).upper() if numbered else "UFC Fight Night"
+            key = f"{_canonical(card_name)}|{local_start.date().isoformat()}"
+            group = groups.setdefault(key, {
+                "name": card_name, "date": local_start.date(), "start": start.to_pydatetime(),
+                "end": pd.to_datetime(event.get("endDate"), utc=True, errors="coerce"), "bouts": [],
+            })
+            group["start"] = min(group["start"], start.to_pydatetime())
+            group["bouts"].append({
+                "event": card_name, "event_date": local_start.date().isoformat(),
+                "fighter_a": outcomes[0], "fighter_b": outcomes[1],
+                "winner": "", "fight_url": "",
+            })
+            break
+    cards = []
+    today = now.astimezone(eastern).date()
+    for key, group in groups.items():
+        unique = {}
+        for bout in group["bouts"]:
+            pair = tuple(sorted((_canonical(bout["fighter_a"]), _canonical(bout["fighter_b"]))))
+            unique[pair] = bout
+        bouts = list(unique.values())
+        end = group["end"].to_pydatetime() if pd.notna(group["end"]) else None
+        if group["start"] <= now and (end is None or now <= end):
+            status = "LIVE"
+        elif group["date"] == today:
+            status = "TODAY"
+        else:
+            status = "UPCOMING"
+        cards.append({
+            "value": f"POLY_CARD::{key}", "bouts": bouts, "status": status, "start": group["start"],
+            "label": f"{status}  •  {group['name']}  •  {group['date'].strftime('%b %d').replace(' 0', ' ')}  •  {len(bouts)} fights",
+        })
+    priority = {"LIVE": 0, "TODAY": 1, "UPCOMING": 2}
+    return sorted(cards, key=lambda card: (priority[card["status"]], card["start"]))
+
+
 @st.cache_resource(show_spinner=False)
 def assets():
     return load_assets(DATA_DIR)
@@ -40,12 +123,23 @@ def assets():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_card(event_search, refresh_results=False):
-    return discover_card(event_search, refresh_results=refresh_results)
+    if str(event_search).startswith("POLY_CARD::"):
+        selected = next((card for card in active_event_cards() if card["value"] == event_search), None)
+        if selected and selected["bouts"]:
+            return selected["bouts"]
+        raise RuntimeError("That card is no longer active. Refresh the page and choose another UFC card.")
+    return engine_discover_card(event_search, refresh_results=refresh_results)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_event_options():
-    return discover_event_options()
+    try:
+        cards = active_event_cards()
+        if cards:
+            return [{"label": card["label"], "value": card["value"]} for card in cards]
+    except Exception:
+        pass
+    return [{"label": "UFC 330  •  Aug 15  •  12 fights", "value": "UFC 330"}]
 
 
 @st.cache_data(ttl=5, show_spinner=False)
