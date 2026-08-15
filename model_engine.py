@@ -143,7 +143,26 @@ def feature_vector(fighter_a: str, fighter_b: str, fighters: pd.DataFrame, featu
     }
     vector = np.array([values[feature] for feature in features], dtype=float)
     experience = min(int(safe_float(a.get("UFC fights"), 0)), int(safe_float(b.get("UFC fights"), 0)))
-    return vector, values, experience
+    source_columns = {
+        "Elo diff": "Elo",
+        "Record diff": "Smoothed win %",
+        "Recent diff": "Recent 5",
+        "Strike diff": "Adj strike diff/min",
+        "TD diff": "Adj TD diff/15",
+        "Control diff": "Adj control min/15",
+        "Reach diff": "Reach",
+        "Age advantage": "Age",
+    }
+    raw_inputs = []
+    for feature in features:
+        column = source_columns[feature]
+        raw_inputs.append({
+            "Factor": FEATURE_LABELS[feature],
+            "Fighter A": safe_float(a.get(column)),
+            "Fighter B": safe_float(b.get(column)),
+            "Model difference": float(values[feature]),
+        })
+    return vector, values, experience, raw_inputs
 
 
 def calibrated_probability(bundle, matrix):
@@ -235,7 +254,7 @@ def discover_card(event_search: str, refresh_results: bool = False):
             "fighter_b": single.group(2).strip(), "winner": "", "fight_url": "",
         }]
     query = canonical_name(re.sub(r"\blive\b", "", event_search, flags=re.I))
-    if "ufc 330" in query and not refresh_results:
+    if re.fullmatch(r"ufc 330", query) and not refresh_results:
         return [{
             "event": "UFC 330: Makhachev vs. Machado Garry", "event_date": "2026-08-15",
             "fighter_a": a, "fighter_b": b, "winner": "", "fight_url": "",
@@ -269,31 +288,116 @@ def parse_jsonish(value, default=None):
         return default
 
 
-def fetch_polymarket_prices():
-    rows = []
+def card_match(card, text):
+    target = canonical_name(text)
+    scored = []
+    for bout in card:
+        direct = canonical_name(f"{bout['fighter_a']} vs {bout['fighter_b']}")
+        reverse = canonical_name(f"{bout['fighter_b']} vs {bout['fighter_a']}")
+        a_last = canonical_name(bout["fighter_a"]).split()[-1]
+        b_last = canonical_name(bout["fighter_b"]).split()[-1]
+        contains_pair = a_last in target.split() and b_last in target.split()
+        score = max(fuzz.partial_ratio(direct, target), fuzz.partial_ratio(reverse, target))
+        scored.append((score + (30 if contains_pair else 0), bout))
+    if not scored:
+        return None
+    score, bout = max(scored, key=lambda item: item[0])
+    return bout if score >= 92 else None
+
+
+def polymarket_book(token_id):
+    data = http_json("https://clob.polymarket.com/book", params={"token_id": str(token_id)})
+    bids = [(safe_float(row.get("price")), safe_float(row.get("size"), 0)) for row in data.get("bids", [])]
+    asks = [(safe_float(row.get("price")), safe_float(row.get("size"), 0)) for row in data.get("asks", [])]
+    bids = [row for row in bids if 0 < row[0] < 1]
+    asks = [row for row in asks if 0 < row[0] < 1]
+    best_bid = max(bids, key=lambda row: row[0]) if bids else (np.nan, 0)
+    best_ask = min(asks, key=lambda row: row[0]) if asks else (np.nan, 0)
+    return {
+        "bid": best_bid[0], "bid_size": best_bid[1],
+        "ask": best_ask[0], "ask_size": best_ask[1],
+        "timestamp": str(data.get("timestamp") or ""),
+    }
+
+
+def fighter_named_in_text(bout, text):
+    target = canonical_name(text)
+    choices = []
+    for fighter in (bout["fighter_a"], bout["fighter_b"]):
+        name = canonical_name(fighter)
+        last = name.split()[-1]
+        score = max(fuzz.partial_ratio(name, target), 100 if last in target.split() else 0)
+        choices.append((score, fighter))
+    choices.sort(reverse=True)
+    return choices[0][1] if choices and choices[0][0] >= 80 and (len(choices) == 1 or choices[0][0] > choices[1][0]) else ""
+
+
+def fetch_polymarket_prices(card):
+    rows, specifications = [], []
     data = http_json("https://gamma-api.polymarket.com/events", params={
-        "tag_id": 279, "active": "true", "closed": "false", "limit": 200,
+        "tag_slug": "ufc", "active": "true", "closed": "false",
+        "order": "endDate", "ascending": "true", "limit": 200,
     })
     for event in data:
+        event_title = str(event.get("title") or "")
         for market in event.get("markets", []):
-            question = str(market.get("question") or event.get("title") or "")
-            outcomes = parse_jsonish(market.get("outcomes"), []) or []
-            prices = parse_jsonish(market.get("outcomePrices"), []) or []
-            if len(outcomes) >= 2 and len(prices) >= 2 and canonical_name(outcomes[0]) not in {"yes", "no"}:
-                rows.append({
-                    "fighter_a": str(outcomes[0]), "fighter_b": str(outcomes[1]),
-                    "price_a": safe_float(prices[0]), "price_b": safe_float(prices[1]),
-                    "source": "Polymarket",
-                })
+            if str(market.get("sportsMarketType") or "").lower() != "moneyline":
                 continue
-            match = re.search(r"(.+?)\s+vs\.?\s+(.+?)(?:\?|$)", question, re.I)
-            ask, bid = safe_float(market.get("bestAsk")), safe_float(market.get("bestBid"))
-            if match and 0 < ask < 1:
-                rows.append({
-                    "fighter_a": match.group(1).strip(), "fighter_b": match.group(2).strip(),
-                    "price_a": ask, "price_b": 1 - bid if 0 < bid < 1 else np.nan,
-                    "source": "Polymarket",
-                })
+            question = str(market.get("question") or "")
+            bout = card_match(card, f"{event_title} {question}")
+            if not bout:
+                continue
+            outcomes = [str(value) for value in (parse_jsonish(market.get("outcomes"), []) or [])]
+            tokens = [str(value) for value in (parse_jsonish(market.get("clobTokenIds"), []) or [])]
+            if len(outcomes) != 2 or len(tokens) != 2:
+                continue
+            normalized = [canonical_name(value) for value in outcomes]
+            if set(normalized) == {"yes", "no"}:
+                subject = fighter_named_in_text(bout, question)
+                if not subject:
+                    continue
+                opponent = bout["fighter_b"] if canonical_name(subject) == canonical_name(bout["fighter_a"]) else bout["fighter_a"]
+                yes_index = normalized.index("yes")
+                no_index = normalized.index("no")
+                fighter_tokens = {subject: tokens[yes_index], opponent: tokens[no_index]}
+            else:
+                fighter_tokens = {}
+                for outcome, token in zip(outcomes, tokens):
+                    fighter = fighter_named_in_text(bout, outcome)
+                    if fighter:
+                        fighter_tokens[fighter] = token
+                if len(fighter_tokens) != 2:
+                    continue
+            specifications.append({
+                "bout": bout, "tokens": fighter_tokens,
+                "url": f"https://polymarket.com/event/{event.get('slug', '')}",
+            })
+    unique_tokens = sorted({token for item in specifications for token in item["tokens"].values()})
+    books = {}
+    with ThreadPoolExecutor(max_workers=min(12, max(1, len(unique_tokens)))) as executor:
+        futures = {executor.submit(polymarket_book, token): token for token in unique_tokens}
+        for future in as_completed(futures):
+            try:
+                books[futures[future]] = future.result()
+            except Exception:
+                pass
+    for item in specifications:
+        bout = item["bout"]
+        token_a = item["tokens"].get(bout["fighter_a"])
+        token_b = item["tokens"].get(bout["fighter_b"])
+        book_a, book_b = books.get(token_a, {}), books.get(token_b, {})
+        ask_a, ask_b = safe_float(book_a.get("ask")), safe_float(book_b.get("ask"))
+        if not (0 < ask_a < 1 and 0 < ask_b < 1):
+            continue
+        rows.append({
+            "fighter_a": bout["fighter_a"], "fighter_b": bout["fighter_b"],
+            "price_a": ask_a, "price_b": ask_b,
+            "ask_a": ask_a, "ask_b": ask_b,
+            "bid_a": safe_float(book_a.get("bid")), "bid_b": safe_float(book_b.get("bid")),
+            "ask_size_a": safe_float(book_a.get("ask_size"), 0), "ask_size_b": safe_float(book_b.get("ask_size"), 0),
+            "source": "Polymarket CLOB", "market_url": item["url"],
+            "market_timestamp": book_a.get("timestamp") or book_b.get("timestamp") or "",
+        })
     return rows
 
 
@@ -339,7 +443,9 @@ def fetch_espn_prices():
             if all(0 < value < 1 for value in values):
                 rows.append({
                     "fighter_a": names[0], "fighter_b": names[1],
-                    "price_a": values[0], "price_b": values[1], "source": "ESPN listed odds",
+                    "price_a": values[0], "price_b": values[1],
+                    "ask_a": values[0], "ask_b": values[1],
+                    "bid_a": np.nan, "bid_b": np.nan, "source": "ESPN listed odds",
                 })
     return rows
 
@@ -356,7 +462,11 @@ def parse_manual_odds(text: str):
 def fetch_market_rows(card, manual_odds_text=""):
     rows = []
     with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(fetcher) for fetcher in (fetch_polymarket_prices, fetch_kalshi_prices, fetch_espn_prices)]
+        futures = [
+            executor.submit(fetch_polymarket_prices, card),
+            executor.submit(fetch_kalshi_prices),
+            executor.submit(fetch_espn_prices),
+        ]
         for future in as_completed(futures):
             try:
                 rows.extend(future.result())
@@ -369,28 +479,41 @@ def fetch_market_rows(card, manual_odds_text=""):
             rows.append({
                 "fighter_a": bout["fighter_a"], "fighter_b": bout["fighter_b"],
                 "price_a": american_to_price(manual[a]), "price_b": american_to_price(manual[b]),
+                "ask_a": american_to_price(manual[a]), "ask_b": american_to_price(manual[b]),
+                "bid_a": np.nan, "bid_b": np.nan,
                 "source": "Manual current odds",
             })
     return rows
 
 
-def best_market_for_bout(bout, market_rows):
+def best_market_for_bout(bout, market_rows, polymarket_only=True):
     aligned = []
     for row in market_rows:
+        if polymarket_only and row.get("source") != "Polymarket CLOB":
+            continue
         if pair_key(row["fighter_a"], row["fighter_b"]) != pair_key(bout["fighter_a"], bout["fighter_b"]):
             continue
         same = canonical_name(row["fighter_a"]) == canonical_name(bout["fighter_a"])
-        price_a = safe_float(row["price_a"] if same else row["price_b"])
-        price_b = safe_float(row["price_b"] if same else row["price_a"])
-        if 0 < price_a < 1 and 0 < price_b < 1:
-            aligned.append({"price_a": price_a, "price_b": price_b, "source": row["source"]})
+        ask_a = safe_float(row.get("ask_a", row["price_a"]) if same else row.get("ask_b", row["price_b"]))
+        ask_b = safe_float(row.get("ask_b", row["price_b"]) if same else row.get("ask_a", row["price_a"]))
+        bid_a = safe_float(row.get("bid_a") if same else row.get("bid_b"))
+        bid_b = safe_float(row.get("bid_b") if same else row.get("bid_a"))
+        if 0 < ask_a < 1 and 0 < ask_b < 1:
+            aligned.append({
+                "price_a": ask_a, "price_b": ask_b, "bid_a": bid_a, "bid_b": bid_b,
+                "source": row["source"], "market_url": row.get("market_url", ""),
+                "market_timestamp": row.get("market_timestamp", ""),
+            })
     if not aligned:
         return None
     best_a = min(aligned, key=lambda row: row["price_a"])
     best_b = min(aligned, key=lambda row: row["price_b"])
     return {
         "price_a": best_a["price_a"], "price_b": best_b["price_b"],
+        "bid_a": best_a["bid_a"], "bid_b": best_b["bid_b"],
         "source_a": best_a["source"], "source_b": best_b["source"],
+        "url_a": best_a["market_url"], "url_b": best_b["market_url"],
+        "timestamp_a": best_a["market_timestamp"], "timestamp_b": best_b["market_timestamp"],
     }
 
 
@@ -410,53 +533,78 @@ def research_shift(texts, fighter_a, fighter_b):
 
 def analyze_card(card, market_rows, bundle, fighters, bankroll=10_000, research_texts=None,
                  min_edge=0.03, cost_buffer=0.02, kelly_fraction=0.25,
-                 max_position_pct=0.02, min_prior_fights=3):
+                 max_position_pct=0.02, min_prior_fights=3, convergence=0.50,
+                 max_card_exposure=0.10, polymarket_only=True):
     research_texts = research_texts or []
     analyses = []
     for bout in card:
-        vector, values, experience = feature_vector(bout["fighter_a"], bout["fighter_b"], fighters, bundle["features"])
+        vector, values, experience, raw_inputs = feature_vector(bout["fighter_a"], bout["fighter_b"], fighters, bundle["features"])
         core_a = float(calibrated_probability(bundle, vector)[0])
         shift = research_shift(research_texts, bout["fighter_a"], bout["fighter_b"])
         probability_a = float(sigmoid(math.log(core_a / (1 - core_a)) + shift))
         probability_b = 1 - probability_a
-        market = best_market_for_bout(bout, market_rows)
+        likely_is_a = probability_a >= probability_b
+        likely_winner = bout["fighter_a"] if likely_is_a else bout["fighter_b"]
+        likely_probability = max(probability_a, probability_b)
+        market = best_market_for_bout(bout, market_rows, polymarket_only=polymarket_only)
         if market:
             edge_a = probability_a - market["price_a"] - cost_buffer
             edge_b = probability_b - market["price_b"] - cost_buffer
             if edge_a >= edge_b:
                 pick, probability, price, edge = bout["fighter_a"], probability_a, market["price_a"], edge_a
-                source, pick_is_a = market["source_a"], True
+                source, market_url, market_timestamp, bid, pick_is_a = market["source_a"], market["url_a"], market["timestamp_a"], market["bid_a"], True
             else:
                 pick, probability, price, edge = bout["fighter_b"], probability_b, market["price_b"], edge_b
-                source, pick_is_a = market["source_b"], False
+                source, market_url, market_timestamp, bid, pick_is_a = market["source_b"], market["url_b"], market["timestamp_b"], market["bid_b"], False
             all_in = min(0.999, price + cost_buffer)
             full_kelly = max(0, (probability - all_in) / max(1e-9, 1 - all_in))
             action = "BET" if edge >= min_edge and experience >= min_prior_fights else "NO BET"
             position = round(bankroll * min(max_position_pct, kelly_fraction * full_kelly), 2) if action == "BET" else 0
+            exit_target = min(probability, price + convergence * max(0, probability - price))
+            scenario_move = exit_target - price
         else:
             pick_is_a = probability_a >= probability_b
             pick = bout["fighter_a"] if pick_is_a else bout["fighter_b"]
             probability = max(probability_a, probability_b)
-            price, edge, source, action, position = np.nan, np.nan, "", "NO BET", 0
+            price, bid, edge, source, action, position = np.nan, np.nan, np.nan, "", "NO BET", 0
+            market_url, market_timestamp, exit_target, scenario_move = "", "", np.nan, np.nan
         drivers = local_drivers(bundle, vector)
         for driver in drivers:
             driver["impact_pick"] = driver["impact_a"] if pick_is_a else -driver["impact_a"]
         top = sorted(drivers, key=lambda row: abs(row["impact_pick"]), reverse=True)[:3]
         if market is None:
-            why = "No current market price"
+            why = "No live Polymarket order book" if polymarket_only else "No current executable price"
         elif experience < min_prior_fights:
             why = f"Only {experience} prior UFC fights on the less-experienced side"
         else:
-            why = "; ".join(f"{row['factor']} {row['impact_pick']:+.1%}" for row in top[:2])
+            prefix = "Underdog value trade. " if probability < 0.5 else ""
+            why = prefix + "; ".join(f"{row['factor']} {row['impact_pick']:+.1%}" for row in top[:2])
         analyses.append({
-            **bout, "pick": pick, "model_probability": probability,
+            **bout, "pick": pick, "trade_side": pick,
+            "likely_winner": likely_winner, "likely_probability": likely_probability,
+            "model_probability": probability,
             "probability_a": probability_a, "probability_b": probability_b,
-            "market_probability": price, "american_odds": price_to_american(price),
+            "market_probability": price, "live_ask": price, "live_bid": bid,
+            "exit_target": exit_target, "scenario_move": scenario_move,
+            "scenario_return": scenario_move / price if 0 < price < 1 and np.isfinite(scenario_move) else np.nan,
+            "american_odds": price_to_american(price),
             "net_edge": edge, "action": action, "position_dollars": position,
             "experience": experience, "why": why, "drivers": top,
-            "research_shift": shift, "market_source": source,
+            "raw_inputs": raw_inputs, "research_shift": shift, "market_source": source,
+            "market_url": market_url, "market_timestamp": market_timestamp,
             "as_of_utc": datetime.now(timezone.utc).isoformat(), "model_version": bundle["version"],
         })
+    total_position = sum(row["position_dollars"] for row in analyses if row["action"] == "BET")
+    exposure_cap = bankroll * max_card_exposure
+    if total_position > exposure_cap > 0:
+        scale = exposure_cap / total_position
+        for row in analyses:
+            if row["action"] == "BET":
+                row["position_dollars"] = round(row["position_dollars"] * scale, 2)
+        rounded_total = sum(row["position_dollars"] for row in analyses if row["action"] == "BET")
+        if rounded_total > exposure_cap:
+            last_bet = next(row for row in reversed(analyses) if row["action"] == "BET")
+            last_bet["position_dollars"] = round(last_bet["position_dollars"] - (rounded_total - exposure_cap), 2)
     return analyses
 
 
@@ -465,6 +613,36 @@ LOG_COLUMNS = [
     "pick", "model_probability", "market_probability", "net_edge", "action",
     "position_dollars", "status", "winner", "outcome", "pnl", "model_version",
 ]
+
+MARKET_HISTORY_COLUMNS = [
+    "timestamp_utc", "event", "fighter_a", "fighter_b", "trade_side",
+    "model_probability", "live_bid", "live_ask", "exit_target", "market_source",
+]
+
+
+def update_market_history(state_dir: Path, analyses):
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "market_history.csv"
+    history = pd.read_csv(path) if path.exists() else pd.DataFrame(columns=MARKET_HISTORY_COLUMNS)
+    snapshots = []
+    for row in analyses:
+        if not np.isfinite(safe_float(row.get("live_ask"))):
+            continue
+        snapshots.append({
+            "timestamp_utc": row["as_of_utc"], "event": row["event"],
+            "fighter_a": row["fighter_a"], "fighter_b": row["fighter_b"],
+            "trade_side": row["trade_side"], "model_probability": row["model_probability"],
+            "live_bid": row["live_bid"], "live_ask": row["live_ask"],
+            "exit_target": row["exit_target"], "market_source": row["market_source"],
+        })
+    if snapshots:
+        incoming = pd.DataFrame(snapshots, columns=MARKET_HISTORY_COLUMNS)
+        history = incoming if history.empty else pd.concat([history, incoming], ignore_index=True)
+        history = history.drop_duplicates(
+            subset=["timestamp_utc", "event", "fighter_a", "fighter_b", "trade_side"], keep="last"
+        ).tail(5000)
+        history.to_csv(path, index=False)
+    return history
 
 
 def update_prediction_log(state_dir: Path, analyses):
@@ -514,8 +692,13 @@ def update_prediction_log(state_dir: Path, analyses):
         if row.get("winner") and not existing:
             continue
         if existing:
-            for key, value in record.items():
-                log.loc[existing[-1], key] = value
+            existing_index = existing[-1]
+            existing_action = str(log.at[existing_index, "action"])
+            # Preserve the original executable entry price once a BET is recorded.
+            # A prior NO BET can become a new entry if the live price later creates an edge.
+            if existing_action != "BET" or record["action"] == "BET" and existing_action == "NO BET":
+                for key, value in record.items():
+                    log.loc[existing_index, key] = value
         else:
             incoming = pd.DataFrame([record], columns=LOG_COLUMNS)
             log = incoming if log.empty else pd.concat([log, incoming], ignore_index=True)

@@ -20,12 +20,13 @@ from model_engine import (
     fetch_market_rows,
     load_assets,
     realized_metrics,
+    update_market_history,
     update_prediction_log,
 )
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT
+DATA_DIR = ROOT / "data" if (ROOT / "data").exists() else ROOT
 STATE_DIR = Path(os.getenv("UFC_EDGE_STATE_DIR", str(ROOT / "state")))
 
 st.set_page_config(page_title="UFC Edge Model", page_icon="🥊", layout="wide", initial_sidebar_state="collapsed")
@@ -41,7 +42,7 @@ def cached_card(event_search, refresh_results=False):
     return discover_card(event_search, refresh_results=refresh_results)
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def cached_markets(card_json, manual_odds):
     return fetch_market_rows(pd.read_json(io.StringIO(card_json)).to_dict("records"), manual_odds)
 
@@ -79,17 +80,18 @@ def dashboard_table(analyses):
         body.append(f"""
         <tr>
           <td><b>{escape(row['fighter_a'])}</b><span>vs {escape(row['fighter_b'])}</span></td>
-          <td>{escape(row['pick'])}</td>
+          <td><b>{escape(row['likely_winner'])}</b><span>{pct(row['likely_probability'])} win probability</span></td>
+          <td><b>{escape(row['trade_side'])}</b><span>{'underdog value' if row['model_probability'] < .5 else 'favored outcome'}</span></td>
           <td class="num strong">{pct(row['model_probability'])}</td>
-          <td class="num">{pct(row['market_probability'])}</td>
+          <td class="num">{pct(row['live_ask'])}</td>
+          <td class="num">{pct(row['exit_target'])}</td>
           <td class="num {edge_class}">{pct(row['net_edge'])}</td>
           <td><i class="decision {decision_class}">{row['action']}</i></td>
           <td class="num">{money(row['position_dollars'])}</td>
-          <td class="why">{escape(row['why'])}</td>
         </tr>""")
     return f"""
     <div class="pricing-table-wrap"><table class="pricing-table">
-      <thead><tr><th>Fight</th><th>Model pick</th><th>Model P</th><th>Market P</th><th>Net edge</th><th>Decision</th><th>Position</th><th>Primary drivers</th></tr></thead>
+      <thead><tr><th>Fight</th><th>Likely winner</th><th>Trade side</th><th>Fair P</th><th>Live ask</th><th>Exit target*</th><th>Net edge</th><th>Decision</th><th>Position</th></tr></thead>
       <tbody>{''.join(body)}</tbody>
     </table></div>"""
 
@@ -129,12 +131,12 @@ st.markdown("""
   .board-title small { color:#1c4d77; font-size:.58rem; font-weight:800; letter-spacing:.15em; }
   .board-title h2 { margin:.25rem 0 0; font-size:1.1rem; }
   .pricing-table-wrap { overflow-x:auto; background:#fff; border:1px solid #d6dee7; }
-  .pricing-table { width:100%; min-width:1080px; border-collapse:collapse; }
+  .pricing-table { width:100%; min-width:1180px; border-collapse:collapse; }
   .pricing-table th { padding:.65rem .72rem; text-align:left; background:#eaf0f5; color:#647588; border-bottom:1px solid #ccd5df; font-size:.54rem; letter-spacing:.1em; text-transform:uppercase; }
   .pricing-table td { padding:.76rem .72rem; border-bottom:1px solid #e0e6ed; font-size:.72rem; vertical-align:middle; }
   .pricing-table tr:last-child td { border-bottom:0; }
-  .pricing-table td:first-child b,.pricing-table td:first-child span { display:block; }
-  .pricing-table td:first-child span { margin-top:.18rem; color:#667587; font-size:.66rem; }
+  .pricing-table td b,.pricing-table td span { display:block; }
+  .pricing-table td span { margin-top:.18rem; color:#667587; font-size:.61rem; }
   .pricing-table .num { text-align:right; font-variant-numeric:tabular-nums; }
   .pricing-table .strong { font-weight:800; }
   .pricing-table .edge-positive { color:#08745a; font-weight:800; }
@@ -156,7 +158,7 @@ st.markdown("""
 <div class="brandbar"><div class="brand"><span class="brand-mark">UE</span><div><b>UFC EDGE</b><small>CALIBRATED FIGHT PRICING</small></div></div><div class="model-pill"><i></i> Gradient boosting · cached</div></div>
 """, unsafe_allow_html=True)
 st.markdown(f"""
-<div class="hero"><div><p>DECISION ENGINE</p><h1>One screen. One price. One decision.</h1><span>Independent UFC probabilities compared with executable market prices.</span></div><div class="holdout"><span>UNSEEN HOLDOUT</span><b>{bundle['metrics']['accuracy']:.1%}</b><small>accuracy</small></div></div>
+<div class="hero"><div><p>UFC TRADING ENGINE</p><h1>Fair value versus the live market.</h1><span>Separate the likely winner from the best-priced trade, then define the exit before entering.</span></div><div class="holdout"><span>UNSEEN HOLDOUT</span><b>{bundle['metrics']['accuracy']:.1%}</b><small>accuracy</small></div></div>
 """, unsafe_allow_html=True)
 
 with st.sidebar:
@@ -164,15 +166,18 @@ with st.sidebar:
     min_edge = st.number_input("Minimum net edge", min_value=0.00, max_value=0.20, value=0.03, step=0.005, format="%.3f")
     cost_buffer = st.number_input("Cost buffer", min_value=0.00, max_value=0.10, value=0.02, step=0.005, format="%.3f")
     min_fights = st.number_input("Minimum prior UFC fights", min_value=0, max_value=25, value=3, step=1)
+    convergence = st.slider("Pre-fight convergence scenario", min_value=0.0, max_value=1.0, value=0.50, step=0.05)
+    max_card_exposure = st.slider("Maximum card exposure", min_value=0.02, max_value=0.25, value=0.10, step=0.01)
+    market_mode = st.selectbox("Market source", ["Polymarket CLOB only", "Best available / manual"])
     refresh_results = st.checkbox("Check completed results", value=False)
     manual_odds = st.text_area("Manual odds override", placeholder="Islam Makhachev, -320\nIan Machado Garry, +250", height=90)
     use_research = st.checkbox("Use capped research overlay", value=False)
     reports = st.file_uploader("Research reports", type=["pdf", "docx", "txt", "md", "csv"], accept_multiple_files=True, disabled=not use_research)
 
 event_col, bankroll_col, button_col = st.columns([6, 2, 2], vertical_alignment="bottom")
-event_search = event_col.text_input("Event or fight", value="UFC 330", placeholder="UFC 330 or Fighter A vs Fighter B")
+event_search = event_col.text_input("Event or fight", value="UFC 330", placeholder="Example: UFC 330 or Fighter A vs Fighter B")
 bankroll = bankroll_col.number_input("Bankroll", min_value=100, max_value=10_000_000, value=10_000, step=100)
-run = button_col.button("Run model", use_container_width=True, type="primary")
+run = button_col.button("Refresh live prices", use_container_width=True, type="primary")
 
 if run:
     started = time.perf_counter()
@@ -185,12 +190,18 @@ if run:
             analyses = analyze_card(
                 card, markets, bundle, fighters, bankroll=bankroll, research_texts=research,
                 min_edge=min_edge, cost_buffer=cost_buffer, min_prior_fights=int(min_fights),
+                convergence=convergence, max_card_exposure=max_card_exposure,
+                polymarket_only=market_mode == "Polymarket CLOB only",
             )
             log = update_prediction_log(STATE_DIR, analyses)
+            market_history = update_market_history(STATE_DIR, analyses)
         st.session_state["analyses"] = analyses
         st.session_state["log"] = log
+        st.session_state["market_history"] = market_history
         st.session_state["event_search"] = event_search
         st.session_state["bankroll"] = bankroll
+        st.session_state["convergence"] = convergence
+        st.session_state["market_mode"] = market_mode
         st.session_state["elapsed"] = time.perf_counter() - started
         st.session_state["excel"] = build_excel(
             analyses, bundle, log, bankroll, event_search,
@@ -204,39 +215,71 @@ if not analyses:
     st.markdown("<div class='math-card' style='text-align:center;min-height:260px;display:grid;place-items:center'><div><small>READY</small><h3>Enter tonight’s event and run the model.</h3><span style='color:#667587;font-size:.75rem'>The trained model stays loaded. Only the card and odds refresh.</span></div></div>", unsafe_allow_html=True)
 else:
     log = st.session_state["log"]
+    market_history = st.session_state.get("market_history", pd.DataFrame())
     bets = [row for row in analyses if row["action"] == "BET"]
     valid_edges = [row["net_edge"] for row in analyses if np.isfinite(row["net_edge"])]
     top_edge = max(valid_edges) if valid_edges else np.nan
     total_risk = sum(row["position_dollars"] for row in bets)
-    st.markdown(f"<div class='statusline'><b>REFRESHED</b> in {st.session_state['elapsed']:.2f}s · {len(analyses)} fights · {sum(bool(row['market_source']) for row in analyses)} matched market prices</div>", unsafe_allow_html=True)
+    poly_count = sum(row["market_source"] == "Polymarket CLOB" for row in analyses)
+    st.markdown(f"<div class='statusline'><b>LIVE REFRESH</b> in {st.session_state['elapsed']:.2f}s · {len(analyses)} fights · {poly_count} Polymarket order books · source mode: {escape(st.session_state['market_mode'])}</div>", unsafe_allow_html=True)
     metric_columns = st.columns(4)
     metric_columns[0].metric("Bet signals", len(bets), f"of {len(analyses)} fights")
     metric_columns[1].metric("Top net edge", pct(top_edge), "after cost buffer")
     metric_columns[2].metric("Capital at risk", money(total_risk), f"{total_risk / bankroll:.1%} of bankroll")
     metric_columns[3].metric("Holdout accuracy", f"{bundle['metrics']['accuracy']:.1%}", f"{bundle['metrics']['holdout_fights']:,} unseen fights")
 
-    dashboard_tab, model_tab, performance_tab, history_tab = st.tabs(["Dashboard", "Model", "Performance", "History"])
+    dashboard_tab, model_tab, raw_tab, performance_tab, history_tab = st.tabs(["Dashboard", "Trade Math", "Raw Inputs", "Performance", "History"])
     with dashboard_tab:
         st.markdown(f"<div class='board-title'><small>PRICING BOARD</small><h2>{escape(analyses[0]['event'])}</h2></div>{dashboard_table(analyses)}", unsafe_allow_html=True)
+        st.caption("*Exit target is a scenario, not a forecast: live ask + convergence assumption × (model fair value − live ask). A trade side below 50% can still be a BET when its price is cheaper than its estimated chance.")
         filename = re.sub(r"[^a-z0-9]+", "_", event_search.lower()).strip("_") or "ufc"
         st.download_button("Download Excel report", st.session_state["excel"], file_name=f"{filename}_edge_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with model_tab:
+        selected_math = st.selectbox("Fight example", range(len(analyses)), format_func=lambda index: f"{analyses[index]['fighter_a']} vs {analyses[index]['fighter_b']}", key="math_fight")
+        example = analyses[selected_math]
         left, right = st.columns([1, 1])
         with left:
-            st.markdown("""
-            <div class="math-card"><small>MODEL MATH</small><h3>Transparent decision stack</h3>
-            <div class="formula-row"><b>Feature vector</b><span>Eight pre-fight A-minus-B differences</span></div>
-            <div class="formula-row"><b>Gradient boosting</b><span>Base score + 0.04 × 200 shallow trees</span></div>
-            <div class="formula-row"><b>Order symmetry</b><span>[GB(x) + 1 − GB(−x)] ÷ 2</span></div>
-            <div class="formula-row"><b>Calibration</b><span>logistic(1.143 × logit(raw P))</span></div>
-            <div class="formula-row"><b>Net edge</b><span>Model P − market P − cost buffer</span></div>
-            <div class="formula-row"><b>Position</b><span>Quarter Kelly, capped at 2.0% of bankroll</span></div></div>
+            st.markdown(f"""
+            <div class="math-card"><small>HOW THE DECISION WORKS</small><h3>Four numbers, in order</h3>
+            <div class="formula-row"><b>Likely winner</b><span>The higher of the two calibrated win probabilities: {escape(example['likely_winner'])} at {pct(example['likely_probability'])}.</span></div>
+            <div class="formula-row"><b>Trade side</b><span>The outcome with the larger price discount: {escape(example['trade_side'])}. It does not have to be above 50%.</span></div>
+            <div class="formula-row"><b>Net edge</b><span>{pct(example['model_probability'])} fair value − {pct(example['live_ask'])} live ask − {pct(cost_buffer)} costs = {pct(example['net_edge'])}.</span></div>
+            <div class="formula-row"><b>Exit scenario</b><span>{pct(example['live_ask'])} + {pct(st.session_state['convergence'])} × (fair value − ask) = {pct(example['exit_target'])} target.</span></div>
+            <div class="formula-row"><b>Decision</b><span>BET only when net edge clears {pct(min_edge)}, experience clears {int(min_fights)} fights, and an executable price exists.</span></div>
+            <div class="formula-row"><b>Position</b><span>Quarter Kelly, capped per fight and scaled so total card exposure stays below the portfolio limit.</span></div></div>
             """, unsafe_allow_html=True)
         with right:
             importance = pd.DataFrame({"Factor": [name.replace(" diff", "") for name in bundle["importance"]], "Importance": list(bundle["importance"].values())}).sort_values("Importance")
-            st.markdown("<div class='math-card'><small>GLOBAL FEATURE IMPORTANCE</small><h3>What the trees use most</h3>", unsafe_allow_html=True)
+            st.markdown("<div class='math-card'><small>MODEL STRUCTURE</small><h3>What the 200 trees use</h3>", unsafe_allow_html=True)
             st.bar_chart(importance.set_index("Factor"), horizontal=True, color="#173B5E", height=270)
             st.markdown("</div>", unsafe_allow_html=True)
+    with raw_tab:
+        selected_raw = st.selectbox("Fight", range(len(analyses)), format_func=lambda index: f"{analyses[index]['fighter_a']} vs {analyses[index]['fighter_b']}", key="raw_fight")
+        raw = analyses[selected_raw]
+        market_cols = st.columns(5)
+        market_cols[0].metric("Fighter A P", pct(raw["probability_a"]))
+        market_cols[1].metric("Fighter B P", pct(raw["probability_b"]))
+        market_cols[2].metric("Live bid", pct(raw["live_bid"]))
+        market_cols[3].metric("Live ask", pct(raw["live_ask"]))
+        market_cols[4].metric("Source", raw["market_source"] or "No market")
+        raw_frame = pd.DataFrame(raw["raw_inputs"]).rename(columns={"Fighter A": raw["fighter_a"], "Fighter B": raw["fighter_b"]})
+        st.dataframe(raw_frame, use_container_width=True, hide_index=True)
+        st.caption(f"Model factors are calculated before the fight. Market snapshot refreshed {raw['as_of_utc']}. Primary read: {raw['why']}")
+        if raw["market_url"]:
+            st.link_button("Open matched Polymarket market", raw["market_url"])
+        if len(market_history):
+            pair_history = market_history[
+                (market_history["event"] == raw["event"])
+                & (market_history["fighter_a"] == raw["fighter_a"])
+                & (market_history["fighter_b"] == raw["fighter_b"])
+                & (market_history["trade_side"] == raw["trade_side"])
+            ].copy()
+            if len(pair_history) > 1:
+                pair_history["timestamp_utc"] = pd.to_datetime(pair_history["timestamp_utc"], errors="coerce")
+                pair_history = pair_history.dropna(subset=["timestamp_utc"]).set_index("timestamp_utc")
+                st.markdown("#### Recorded price movement")
+                st.line_chart(pair_history[["live_bid", "live_ask", "model_probability", "exit_target"]])
+                st.caption("This chart tests the convergence thesis using snapshots recorded by this app. It does not assume convergence occurred.")
     with performance_tab:
         realized = realized_metrics(log)
         columns = st.columns(4)
@@ -251,10 +294,18 @@ else:
         live[3].metric("Recorded P&L", money(realized["pnl"]))
         st.caption("The 2025–2026 holdout was not used to train or calibrate the model.")
     with history_tab:
-        if len(log):
-            display_columns = ["event_date", "fighter_a", "fighter_b", "pick", "model_probability", "market_probability", "net_edge", "action", "position_dollars", "status", "outcome", "pnl"]
-            st.dataframe(log[display_columns].sort_values("timestamp_utc", ascending=False), use_container_width=True, hide_index=True)
-        else:
-            st.info("No recorded predictions yet.")
+        prediction_history, price_history = st.tabs(["Predictions", "Market snapshots"])
+        with prediction_history:
+            if len(log):
+                display_columns = ["event_date", "fighter_a", "fighter_b", "pick", "model_probability", "market_probability", "net_edge", "action", "position_dollars", "status", "outcome", "pnl"]
+                ordered = log.sort_values("timestamp_utc", ascending=False) if "timestamp_utc" in log.columns else log
+                st.dataframe(ordered[[column for column in display_columns if column in ordered.columns]], use_container_width=True, hide_index=True)
+            else:
+                st.info("No recorded predictions yet.")
+        with price_history:
+            if len(market_history):
+                st.dataframe(market_history.sort_values("timestamp_utc", ascending=False), use_container_width=True, hide_index=True)
+            else:
+                st.info("No market snapshots recorded yet.")
 
 st.markdown(f"<div class='fineprint'>{bundle['version']} · For research use · Probabilities are estimates, not guarantees</div>", unsafe_allow_html=True)
