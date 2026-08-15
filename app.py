@@ -28,6 +28,7 @@ from model_engine import (
     grade_prediction_log,
     load_assets,
     load_prediction_log,
+    mark_prediction_log,
     merge_prediction_log,
     realized_metrics,
     safe_float,
@@ -271,9 +272,11 @@ def convergence_monitor(analyses, prediction_log, price_histories, capture_targe
             signal = "HOLD"
             reason = f"Target bid {target_price:.1%}; current bid {bid:.1%}" if np.isfinite(target_price) else "Waiting for measurable convergence"
         rows.append({
+            "prediction_id": prediction_id,
             "fight": f"{analysis['fighter_a']} vs {analysis['fighter_b']}",
+            "event": analysis["event"], "fighter_a": analysis["fighter_a"], "fighter_b": analysis["fighter_b"],
             "trade_side": analysis["trade_side"], "entry_price": entry,
-            "morning_price": morning_price, "current_bid": bid, "current_mid": current_mid,
+            "morning_price": morning_price, "current_bid": bid, "current_ask": ask, "current_mid": current_mid,
             "fair_value": fair, "gap_closed": gap_closed, "position_capture": capture,
             "unrealized_return": exit_return, "unrealized_pnl": unrealized_pnl,
             "position_dollars": dollars, "target_price": target_price,
@@ -675,6 +678,7 @@ if run or auto_requested:
                 minimum_exit_return=minimum_exit_return, stop_loss=stop_loss,
                 cost_buffer=cost_buffer,
             )
+            log = mark_prediction_log(STATE_DIR, convergence_rows)
         st.session_state["analyses"] = analyses
         st.session_state["log"] = log
         st.session_state["market_history"] = market_history
@@ -711,18 +715,15 @@ else:
     total_risk = sum(row["position_dollars"] for row in bets)
     poly_count = sum(row["market_source"] == "Polymarket CLOB" for row in analyses)
     convergence_rows = st.session_state.get("convergence_rows", [])
+    main_performance = realized_metrics(log)
     st.markdown(event_strip(analyses), unsafe_allow_html=True)
     st.markdown(f"<div class='statusline'><b>SYNCED</b> // {st.session_state['elapsed']:.2f}s // EXECUTABLE ASK DRIVES ENTRY // EXECUTABLE BID DRIVES EXIT // {escape(st.session_state['market_mode'])}</div>", unsafe_allow_html=True)
     metric_columns = st.columns(4)
-    metric_columns[0].metric("Bets", len(bets), f"{len(analyses)} fights screened")
-    metric_columns[1].metric("Top edge", pct(top_edge), "net of buffer")
-    metric_columns[2].metric("Card risk", money(total_risk), f"{total_risk / bankroll:.1%} of bankroll")
-    metric_columns[3].metric("Backtest", f"{bundle['metrics']['accuracy']:.1%}", f"{bundle['metrics']['holdout_fights']:,} unseen fights")
-    active_strip = active_positions_strip(convergence_rows)
-    if active_strip:
-        st.markdown(active_strip, unsafe_allow_html=True)
-
-    dashboard_tab, convergence_tab, performance_tab, model_tab, raw_tab, history_tab = st.tabs(["Fight Board", "Positions", "Backtester", "Model Math", "Raw Data", "Audit Log"])
+    metric_columns[0].metric("Net profit", signed_money(main_performance["total_pnl"]), f"{pct(main_performance['net_return'])} on recorded stakes")
+    metric_columns[1].metric("Bets", len(bets), f"{len(analyses)} fights screened")
+    metric_columns[2].metric("Top edge", pct(top_edge), "net of buffer")
+    metric_columns[3].metric("Card risk", money(total_risk), f"{total_risk / bankroll:.1%} of bankroll")
+    dashboard_tab, convergence_tab, performance_tab, model_tab, raw_tab, history_tab = st.tabs(["Fight Board", "Positions", "Track Record", "Model Math", "Raw Data", "Audit Log"])
     with dashboard_tab:
         st.markdown(fight_board(analyses, convergence_rows), unsafe_allow_html=True)
         with st.expander("Detailed pricing table"):
@@ -813,60 +814,64 @@ else:
         paper = log[log["action"] == "BET"].copy() if len(log) else pd.DataFrame()
         open_paper = paper[paper["status"] == "OPEN"].copy() if len(paper) else pd.DataFrame()
         completed_paper = paper[paper["status"] == "COMPLETED"].copy() if len(paper) else pd.DataFrame()
+        inception = realized["inception"].strftime("%b %d, %Y") if pd.notna(realized["inception"]) else "—"
         paper_metrics = st.columns(6)
-        paper_metrics[0].metric("Open bets", realized["open"])
-        paper_metrics[1].metric("Settled", realized["graded"])
-        paper_metrics[2].metric("Wins", realized["wins"])
-        paper_metrics[3].metric("Losses", realized["losses"])
-        paper_metrics[4].metric("Win rate", pct(realized["win_rate"]))
-        paper_metrics[5].metric("Realized P&L", money(realized["pnl"]))
-        st.markdown("<div class='board-title'><small>PAPER LEDGER</small><h2>EVERY BET SIGNAL IS RECORDED AT THE FIRST LIVE ASK</h2></div>", unsafe_allow_html=True)
-        if len(open_paper):
-            st.markdown("#### Open paper bets")
-            open_paper["fight"] = open_paper["fighter_a"] + " vs " + open_paper["fighter_b"]
-            open_columns = ["entry_timestamp_utc", "event", "fight", "pick", "model_probability", "entry_price", "net_edge", "position_dollars", "potential_profit", "status"]
-            st.dataframe(open_paper[[column for column in open_columns if column in open_paper.columns]], width="stretch", hide_index=True, column_config={
-                "model_probability": st.column_config.NumberColumn("Model P", format="percent"),
-                "entry_price": st.column_config.NumberColumn("Entry Price", format="percent"),
-                "net_edge": st.column_config.NumberColumn("Net Edge", format="percent"),
+        paper_metrics[0].metric("Tracking since", inception)
+        paper_metrics[1].metric("Bets recorded", len(paper), f"{realized['open']} open // {realized['graded']} settled")
+        paper_metrics[2].metric("Net return", pct(realized["net_return"]), f"{signed_money(realized['total_pnl'])} net P&L")
+        paper_metrics[3].metric("Realized P&L", signed_money(realized["pnl"]), f"{pct(realized['roi'])} on settled stakes")
+        paper_metrics[4].metric("Open P&L", signed_money(realized["open_pnl"]), f"{realized['marked_open']} of {realized['open']} live-priced")
+        paper_metrics[5].metric("Win rate", pct(realized["win_rate"]), f"{realized['wins']}W // {realized['losses']}L")
+        st.markdown("<div class='board-title'><small>MODEL TRACK RECORD</small><h2>IF EVERY RECORDED BET HAD BEEN TAKEN AT ITS ORIGINAL ENTRY</h2></div>", unsafe_allow_html=True)
+        active_strip = active_positions_strip(convergence_rows)
+        if active_strip:
+            st.markdown(active_strip, unsafe_allow_html=True)
+        if len(paper):
+            ledger = paper.copy()
+            ledger["fight"] = ledger["fighter_a"] + " vs " + ledger["fighter_b"]
+            ledger["entry_timestamp_utc"] = pd.to_datetime(ledger["entry_timestamp_utc"], utc=True, errors="coerce")
+            completed_mask = ledger["status"] == "COMPLETED"
+            ledger["latest_price"] = ledger["live_bid"]
+            ledger.loc[completed_mask, "latest_price"] = ledger.loc[completed_mask, "exit_price"]
+            ledger["net_return"] = ledger["unrealized_return"]
+            ledger.loc[completed_mask, "net_return"] = ledger.loc[completed_mask, "return_pct"]
+            ledger["net_pnl"] = ledger["unrealized_pnl"]
+            ledger.loc[completed_mask, "net_pnl"] = ledger.loc[completed_mask, "pnl"]
+            ledger["track_status"] = ledger["position_signal"].replace("", "OPEN")
+            ledger.loc[completed_mask, "track_status"] = ledger.loc[completed_mask, "outcome"]
+            ledger = ledger.sort_values("entry_timestamp_utc", ascending=False)
+            ledger_columns = ["entry_timestamp_utc", "fight", "pick", "position_dollars", "entry_price", "latest_price", "target_price", "net_return", "net_pnl", "track_status"]
+            st.dataframe(ledger[ledger_columns], width="stretch", hide_index=True, column_config={
+                "entry_timestamp_utc": st.column_config.DatetimeColumn("Entry time", format="MMM D, YYYY h:mm a"),
+                "fight": st.column_config.TextColumn("Fight"),
+                "pick": st.column_config.TextColumn("Bet taken"),
                 "position_dollars": st.column_config.NumberColumn("Stake", format="dollar"),
-                "potential_profit": st.column_config.NumberColumn("Profit If Win", format="dollar"),
+                "entry_price": st.column_config.NumberColumn("Entry", format="percent"),
+                "latest_price": st.column_config.NumberColumn("Current / final", format="percent"),
+                "target_price": st.column_config.NumberColumn("Target", format="percent"),
+                "net_return": st.column_config.NumberColumn("Net return", format="percent"),
+                "net_pnl": st.column_config.NumberColumn("Net P&L", format="dollar"),
+                "track_status": st.column_config.TextColumn("Status"),
             })
-        else:
-            st.info("No open paper bets. A row is added automatically the first time a fight qualifies as BET.")
-        if len(completed_paper):
-            st.markdown("#### Completed paper bets")
-            completed_paper["fight"] = completed_paper["fighter_a"] + " vs " + completed_paper["fighter_b"]
-            completed_paper = completed_paper.sort_values("settled_timestamp_utc", ascending=False)
-            completed_columns = ["event_date", "fight", "pick", "winner", "entry_price", "position_dollars", "outcome", "return_pct", "pnl", "exit_type"]
-            st.dataframe(completed_paper[[column for column in completed_columns if column in completed_paper.columns]], width="stretch", hide_index=True, column_config={
-                "entry_price": st.column_config.NumberColumn("Entry Price", format="percent"),
-                "position_dollars": st.column_config.NumberColumn("Stake", format="dollar"),
-                "return_pct": st.column_config.NumberColumn("Return", format="percent"),
-                "pnl": st.column_config.NumberColumn("P&L", format="dollar"),
-            })
-            curve = completed_paper.copy()
-            curve["settled_timestamp_utc"] = pd.to_datetime(curve["settled_timestamp_utc"], utc=True, errors="coerce")
-            curve["pnl"] = pd.to_numeric(curve["pnl"], errors="coerce").fillna(0)
-            curve = curve.dropna(subset=["settled_timestamp_utc"]).sort_values("settled_timestamp_utc")
+            curve_rows = []
+            for _, record in completed_paper.iterrows():
+                curve_rows.append({"timestamp": record.get("settled_timestamp_utc"), "pnl": safe_float(record.get("pnl"), 0)})
+            for _, record in open_paper.iterrows():
+                if np.isfinite(safe_float(record.get("unrealized_pnl"))):
+                    curve_rows.append({"timestamp": record.get("last_price_timestamp_utc"), "pnl": safe_float(record.get("unrealized_pnl"), 0)})
+            curve = pd.DataFrame(curve_rows)
             if len(curve):
-                curve["Cumulative P&L"] = curve["pnl"].cumsum()
-                st.line_chart(curve.set_index("settled_timestamp_utc")[["Cumulative P&L"]], color="#E10600", height=270)
+                curve["timestamp"] = pd.to_datetime(curve["timestamp"], utc=True, errors="coerce")
+                curve = curve.dropna(subset=["timestamp"]).sort_values("timestamp")
+                curve["Net P&L"] = curve["pnl"].cumsum()
+                st.line_chart(curve.set_index("timestamp")[["Net P&L"]], color="#E10600", height=270)
+            st.caption("NET RETURN = realized fight results + current executable bids on open positions, divided by total recorded stakes.")
         else:
-            st.caption("Completed bets will appear here after the official UFC result is published and the app refreshes.")
+            st.info("The track record begins automatically when the first fight qualifies as BET.")
         st.download_button(
-            "Download paper ledger CSV", log.to_csv(index=False).encode("utf-8"),
+            "Download full track record", log.to_csv(index=False).encode("utf-8"),
             file_name="ufc_paper_trade_ledger.csv", mime="text/csv",
         )
-        with st.expander("Restore a prior paper ledger"):
-            ledger_file = st.file_uploader("Paper ledger CSV", type=["csv"], key="paper_ledger_restore")
-            if ledger_file is not None and st.button("Restore ledger", key="restore_ledger_button"):
-                try:
-                    restored = merge_prediction_log(STATE_DIR, pd.read_csv(io.BytesIO(ledger_file.getvalue())))
-                    st.session_state["log"] = reconcile_paper_results(restored)
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Ledger could not be restored: {exc}")
         st.markdown("<div class='board-title'><small>FROZEN MODEL TEST</small><h2>UNSEEN HISTORICAL FIGHTS</h2></div>", unsafe_allow_html=True)
         columns = st.columns(4)
         columns[0].metric("Unseen holdout", f"{bundle['metrics']['holdout_fights']:,}")
@@ -887,6 +892,15 @@ else:
                 st.dataframe(market_history.sort_values("timestamp_utc", ascending=False), use_container_width=True, hide_index=True)
             else:
                 st.info("No market snapshots recorded yet.")
+        with st.expander("Ledger data management"):
+            ledger_file = st.file_uploader("Restore track-record CSV", type=["csv"], key="paper_ledger_restore")
+            if ledger_file is not None and st.button("Restore track record", key="restore_ledger_button"):
+                try:
+                    restored = merge_prediction_log(STATE_DIR, pd.read_csv(io.BytesIO(ledger_file.getvalue())))
+                    st.session_state["log"] = reconcile_paper_results(restored)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Track record could not be restored: {exc}")
 
 
 @st.fragment(run_every=30)

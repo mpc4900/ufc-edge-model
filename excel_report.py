@@ -408,10 +408,15 @@ def build_excel(
     backtest.merge_range("A11:C11", "RECORDED LIVE DECISIONS", fmt["section"])
     live_rows = [
         ("Open paper bets", realized["open"], "int"), ("Open paper risk", realized["open_risk"], "money"),
+        ("Open mark-to-market P&L", realized["open_pnl"], "money"),
+        ("Open positions with live marks", realized["marked_open"], "int"),
         ("Settled paper bets", realized["graded"], "int"), ("Wins", realized["wins"], "int"),
         ("Losses", realized["losses"], "int"), ("Win rate", realized["win_rate"], "pct"),
         ("Total settled stake", realized["staked"], "money"), ("Recorded ROI", realized["roi"], "pct"),
-        ("Recorded P&L", realized["pnl"], "money"),
+        ("Realized P&L", realized["pnl"], "money"),
+        ("Total recorded stakes", realized["total_staked"], "money"),
+        ("Net model P&L", realized["total_pnl"], "money"),
+        ("Net model return", realized["net_return"], "pct"),
     ]
     for row, (metric, value, kind) in enumerate(live_rows, start=11):
         backtest.write(row, 0, metric, fmt["label"])
@@ -440,18 +445,27 @@ def build_excel(
 
     log_rows = prediction_log.to_dict("records") if len(prediction_log) else []
     paper_rows = prediction_log[prediction_log["action"] == "BET"].to_dict("records") if len(prediction_log) and "action" in prediction_log.columns else []
-    _table_sheet(workbook, fmt, "PAPER LEDGER", "UFC EDGE — PAPER-TRADE BACKTESTER", "Every BET is frozen at its first executable ask and settled from the official fight result", [
-        ("Entry Timestamp UTC", "entry_timestamp_utc", 23, "text"), ("Event Date", "event_date", 14, "date"),
-        ("Event", "event", 19, "text"), ("Fighter A", "fighter_a", 22, "text"), ("Fighter B", "fighter_b", 22, "text"),
-        ("Paper Pick", "pick", 22, "text"), ("Model P", "model_probability", 12, "pct"),
-        ("Entry Price", "entry_price", 12, "pct"), ("Entry Odds", "entry_odds", 12, "int"),
-        ("Net Edge", "net_edge", 12, "pct"), ("Stake", "position_dollars", 13, "money"),
-        ("Profit If Win", "potential_profit", 14, "money"), ("Status", "status", 12, "text"),
-        ("Winner", "winner", 22, "text"), ("Outcome", "outcome", 12, "text"),
-        ("Settlement UTC", "settled_timestamp_utc", 23, "text"), ("Exit Type", "exit_type", 15, "text"),
-        ("Exit Price", "exit_price", 11, "pct"), ("Return", "return_pct", 12, "pct"),
-        ("P&L", "pnl", 13, "money"), ("Closing Reason", "closing_reason", 42, "wrap"),
-    ], paper_rows)
+    track_rows = []
+    for record in paper_rows:
+        completed = str(record.get("status")) == "COMPLETED"
+        track_rows.append({
+            **record,
+            "fight": f"{record.get('fighter_a', '')} vs {record.get('fighter_b', '')}",
+            "current_final_price": record.get("exit_price") if completed else record.get("live_bid"),
+            "effective_return": record.get("return_pct") if completed else record.get("unrealized_return"),
+            "effective_pnl": record.get("pnl") if completed else record.get("unrealized_pnl"),
+            "track_status": record.get("outcome") if completed else (record.get("position_signal") or "OPEN"),
+            "last_mark_utc": record.get("settled_timestamp_utc") if completed else record.get("last_price_timestamp_utc"),
+        })
+    _table_sheet(workbook, fmt, "TRACK RECORD", "UFC EDGE — MODEL TRACK RECORD", "Every recorded BET at its original entry; open positions use the executable bid and completed positions use the official result", [
+        ("Entry UTC", "entry_timestamp_utc", 23, "text"), ("Event", "event", 17, "text"),
+        ("Fight", "fight", 34, "text"), ("Bet Taken", "pick", 22, "text"),
+        ("Stake", "position_dollars", 13, "money"), ("Entry", "entry_price", 11, "pct"),
+        ("Current / Final", "current_final_price", 14, "pct"), ("Sell Target", "target_price", 13, "pct"),
+        ("Target Progress", "target_progress", 15, "pct"), ("Net Return", "effective_return", 13, "pct"),
+        ("Net P&L", "effective_pnl", 13, "money"), ("Status", "track_status", 12, "text"),
+        ("Official Winner", "winner", 22, "text"), ("Last Mark UTC", "last_mark_utc", 23, "text"),
+    ], track_rows)
     _table_sheet(workbook, fmt, "PREDICTION LOG", "UFC EDGE — PREDICTION LOG", "Entries are recorded before results; completed rows are graded as wins or losses", [
         ("Timestamp UTC", "timestamp_utc", 23, "text"), ("Event Date", "event_date", 14, "date"),
         ("Event", "event", 19, "text"), ("Fighter A", "fighter_a", 22, "text"), ("Fighter B", "fighter_b", 22, "text"),

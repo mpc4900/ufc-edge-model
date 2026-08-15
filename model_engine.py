@@ -705,17 +705,22 @@ LOG_COLUMNS = [
     "position_dollars", "entry_timestamp_utc", "entry_price", "entry_odds",
     "potential_profit", "status", "winner", "outcome", "settled_timestamp_utc",
     "exit_type", "exit_price", "return_pct", "pnl", "closing_reason", "model_version",
+    "last_price_timestamp_utc", "live_bid", "live_ask", "target_price",
+    "target_progress", "unrealized_return", "unrealized_pnl", "position_signal",
 ]
 
 LOG_TEXT_COLUMNS = [
     "prediction_id", "timestamp_utc", "event_date", "event", "fighter_a", "fighter_b",
     "pick", "action", "entry_timestamp_utc", "status", "winner", "outcome",
     "settled_timestamp_utc", "exit_type", "closing_reason", "model_version",
+    "last_price_timestamp_utc", "position_signal",
 ]
 
 LOG_NUMERIC_COLUMNS = [
     "model_probability", "market_probability", "net_edge", "position_dollars",
     "entry_price", "entry_odds", "potential_profit", "exit_price", "return_pct", "pnl",
+    "live_bid", "live_ask", "target_price", "target_progress",
+    "unrealized_return", "unrealized_pnl",
 ]
 
 MARKET_HISTORY_COLUMNS = [
@@ -916,6 +921,9 @@ def update_prediction_log(state_dir: Path, analyses):
             "potential_profit": potential_profit, "status": "OPEN", "winner": "",
             "outcome": "", "settled_timestamp_utc": "", "exit_type": "", "exit_price": np.nan,
             "return_pct": np.nan, "pnl": 0, "closing_reason": "", "model_version": row["model_version"],
+            "last_price_timestamp_utc": "", "live_bid": np.nan, "live_ask": np.nan,
+            "target_price": np.nan, "target_progress": np.nan,
+            "unrealized_return": np.nan, "unrealized_pnl": np.nan, "position_signal": "",
         }
         completed = ((log.get("prediction_id", pd.Series(dtype=str)) == prediction_id) & (log.get("status", pd.Series(dtype=str)) == "COMPLETED")).any()
         if completed:
@@ -941,6 +949,41 @@ def update_prediction_log(state_dir: Path, analyses):
     return log
 
 
+def mark_prediction_log(state_dir: Path, position_rows):
+    """Persist the latest executable mark for every open paper position on the loaded card."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "prediction_log.csv"
+    log = load_prediction_log(state_dir)
+    marked_at = datetime.now(timezone.utc).isoformat()
+    for row in position_rows or []:
+        prediction_id = str(row.get("prediction_id") or "")
+        if not prediction_id:
+            continue
+        matches = log.index[
+            (log["prediction_id"] == prediction_id)
+            & (log["status"] == "OPEN")
+            & (log["action"] == "BET")
+        ].tolist()
+        if not matches:
+            continue
+        index = matches[-1]
+        values = {
+            "last_price_timestamp_utc": marked_at,
+            "live_bid": safe_float(row.get("current_bid")),
+            "live_ask": safe_float(row.get("current_ask")),
+            "target_price": safe_float(row.get("target_price")),
+            "target_progress": safe_float(row.get("target_progress")),
+            "unrealized_return": safe_float(row.get("unrealized_return")),
+            "unrealized_pnl": safe_float(row.get("unrealized_pnl")),
+            "position_signal": str(row.get("signal") or ""),
+        }
+        for column, value in values.items():
+            log.at[index, column] = value
+    log = normalize_prediction_log(log)
+    log.to_csv(path, index=False)
+    return log
+
+
 def realized_metrics(log):
     log = normalize_prediction_log(log)
     completed = log[log["status"] == "COMPLETED"] if len(log) else pd.DataFrame()
@@ -951,9 +994,18 @@ def realized_metrics(log):
     staked = float(pd.to_numeric(bets.get("position_dollars", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if len(bets) else 0
     pnl = float(pd.to_numeric(bets.get("pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if len(bets) else 0
     open_risk = float(pd.to_numeric(open_bets.get("position_dollars", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if len(open_bets) else 0
+    open_pnl = float(pd.to_numeric(open_bets.get("unrealized_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if len(open_bets) else 0
+    marked_open = int(pd.to_numeric(open_bets.get("live_bid", pd.Series(dtype=float)), errors="coerce").notna().sum()) if len(open_bets) else 0
+    total_staked = staked + open_risk
+    total_pnl = pnl + open_pnl
+    entry_times = pd.to_datetime(log.loc[log["action"] == "BET", "entry_timestamp_utc"], utc=True, errors="coerce") if len(log) else pd.Series(dtype="datetime64[ns, UTC]")
     return {
         "wins": wins, "losses": losses, "graded": len(bets), "open": len(open_bets),
         "pnl": pnl, "roi": pnl / staked if staked else np.nan,
         "win_rate": wins / len(bets) if len(bets) else np.nan,
         "staked": staked, "open_risk": open_risk,
+        "open_pnl": open_pnl, "marked_open": marked_open,
+        "total_pnl": total_pnl, "total_staked": total_staked,
+        "net_return": total_pnl / total_staked if total_staked else np.nan,
+        "inception": entry_times.min() if entry_times.notna().any() else pd.NaT,
     }
