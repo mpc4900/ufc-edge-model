@@ -23,9 +23,14 @@ from excel_report import build_excel
 from model_engine import (
     analyze_card,
     discover_card as engine_discover_card,
+    fetch_completed_results_for_log,
     fetch_market_rows,
+    grade_prediction_log,
     load_assets,
+    load_prediction_log,
+    merge_prediction_log,
     realized_metrics,
+    safe_float,
     update_market_history,
     update_prediction_log,
 )
@@ -171,6 +176,27 @@ def cached_price_histories(token_ids):
     return histories
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_completed_results(open_log_json):
+    open_log = pd.read_json(io.StringIO(open_log_json), orient="records")
+    return fetch_completed_results_for_log(open_log)
+
+
+def reconcile_paper_results(log):
+    """Grade due paper bets from completed UFCStats results when the app is opened."""
+    if not isinstance(log, pd.DataFrame) or log.empty:
+        return load_prediction_log(STATE_DIR)
+    open_bets = log[(log["status"] == "OPEN") & (log["action"] == "BET")]
+    if open_bets.empty:
+        return log
+    signature_columns = ["prediction_id", "event_date", "event", "fighter_a", "fighter_b", "action", "status"]
+    try:
+        completed = cached_completed_results(open_bets[signature_columns].to_json(orient="records"))
+        return grade_prediction_log(STATE_DIR, completed) if completed else log
+    except Exception:
+        return log
+
+
 def convergence_monitor(analyses, prediction_log, price_histories, capture_target=.65,
                         minimum_exit_return=.03, stop_loss=.15, cost_buffer=.02):
     """Measure observed price discovery and create pre-fight HOLD/SELL signals."""
@@ -213,13 +239,17 @@ def convergence_monitor(analyses, prediction_log, price_histories, capture_targe
             required_capture = max(.40, capture_target - .15)
         elif np.isfinite(hours_to_event) and hours_to_event <= 24:
             required_capture = max(.50, capture_target - .05)
-        entry = float(position.get("market_probability", np.nan)) if position else np.nan
-        dollars = float(position.get("position_dollars", 0)) if position else 0
+        entry = safe_float(position.get("entry_price"), safe_float(position.get("market_probability"))) if position else np.nan
+        dollars = safe_float(position.get("position_dollars"), 0) if position else 0
+        entry_timestamp = (position.get("entry_timestamp_utc") or position.get("timestamp_utc") or "") if position else ""
         entry_gap = fair - entry if np.isfinite(entry) else np.nan
         capture = ((bid - entry) / entry_gap) if np.isfinite(bid) and np.isfinite(entry_gap) and abs(entry_gap) >= .005 else np.nan
         exit_return = (bid / entry - 1) if np.isfinite(bid) and 0 < entry < 1 else np.nan
         unrealized_pnl = dollars * exit_return if np.isfinite(exit_return) else np.nan
         target_price = entry + required_capture * entry_gap if np.isfinite(entry_gap) else np.nan
+        target_move = target_price - entry if np.isfinite(target_price) and np.isfinite(entry) else np.nan
+        target_progress = ((bid - entry) / target_move) if np.isfinite(bid) and np.isfinite(target_move) and abs(target_move) >= .005 else np.nan
+        distance_to_target = target_price - bid if np.isfinite(target_price) and np.isfinite(bid) else np.nan
         remaining_edge = fair - ask - cost_buffer if np.isfinite(ask) else np.nan
         if not position:
             signal = "WATCH"
@@ -247,6 +277,8 @@ def convergence_monitor(analyses, prediction_log, price_histories, capture_targe
             "fair_value": fair, "gap_closed": gap_closed, "position_capture": capture,
             "unrealized_return": exit_return, "unrealized_pnl": unrealized_pnl,
             "position_dollars": dollars, "target_price": target_price,
+            "target_progress": target_progress, "distance_to_target": distance_to_target,
+            "entry_timestamp_utc": entry_timestamp,
             "hours_to_event": hours_to_event, "signal": signal, "reason": reason,
             "token_id": token_id, "history": points,
         })
@@ -283,6 +315,13 @@ def money(value):
     return f"${float(value):,.0f}"
 
 
+def signed_money(value):
+    if value is None or not np.isfinite(float(value)):
+        return "—"
+    amount = float(value)
+    return f"{'+' if amount >= 0 else '-'}${abs(amount):,.0f}"
+
+
 def dashboard_table(analyses):
     body = []
     for row in analyses:
@@ -305,6 +344,97 @@ def dashboard_table(analyses):
       <thead><tr><th>Fight</th><th>Likely winner</th><th>Trade side</th><th>Fair P</th><th>Live ask</th><th>Exit target*</th><th>Net edge</th><th>Decision</th><th>Position</th></tr></thead>
       <tbody>{''.join(body)}</tbody>
     </table></div>"""
+
+
+def fight_board(analyses, convergence_rows=None):
+    """Render a compact bout-by-bout board with the decision as the visual endpoint."""
+    convergence_rows = convergence_rows or []
+    rows = []
+    for number, row in enumerate(analyses, start=1):
+        monitor = convergence_rows[number - 1] if number <= len(convergence_rows) else {}
+        position_open = safe_float(monitor.get("position_dollars"), 0) > 0
+        is_bet = position_open or row["action"] == "BET"
+        action_class = "bet-card" if is_bet else "pass-card"
+        action_label = "BET TAKEN" if position_open else row["action"]
+        if position_open:
+            action_note = f"{money(monitor['position_dollars'])} @ {pct(monitor.get('entry_price'))}"
+        else:
+            action_note = f"{money(row['position_dollars'])} // READY" if is_bet else "EDGE / DATA FILTER"
+        reason = row.get("why") or "No model explanation available"
+        rows.append(f"""
+        <article class="fight-row {action_class}">
+          <div class="bout-id"><span>BOUT</span><b>{number:02d}</b></div>
+          <div class="matchup">
+            <strong>{escape(row['fighter_a'])}</strong>
+            <i>VS</i>
+            <strong>{escape(row['fighter_b'])}</strong>
+            <small>MODEL LEAN&nbsp;&nbsp; {escape(row['likely_winner'])} &nbsp;{pct(row['likely_probability'])}</small>
+          </div>
+          <div class="trade-side"><span>TRADE</span><b>{escape(row['trade_side'])}</b><small>{escape(reason)}</small></div>
+          <div class="price-cell"><span>MODEL</span><b>{pct(row['model_probability'])}</b></div>
+          <div class="price-cell live"><span><i></i>LIVE ASK</span><b>{pct(row['live_ask'])}</b><small>bid {pct(row['live_bid'])}</small></div>
+          <div class="price-cell edge"><span>NET EDGE</span><b>{pct(row['net_edge'])}</b><small>after buffer</small></div>
+          <div class="fight-action"><span>{action_label}</span><b>{action_note}</b></div>
+        </article>""")
+    return f"<div class='fight-board'>{''.join(rows)}</div>"
+
+
+def event_strip(analyses):
+    bets = [row for row in analyses if row["action"] == "BET"]
+    ranked = [row for row in bets if np.isfinite(safe_float(row.get("net_edge")))]
+    top = max(ranked, key=lambda row: row["net_edge"]) if ranked else None
+    top_trade = escape(top["trade_side"]) if top else "NO QUALIFYING TRADE"
+    top_edge = pct(top["net_edge"]) if top else "—"
+    live_books = sum(row.get("market_source") == "Polymarket CLOB" for row in analyses)
+    refreshed_at = pd.to_datetime(analyses[0].get("as_of_utc"), utc=True, errors="coerce")
+    refreshed = refreshed_at.strftime("%H:%M:%S UTC") if pd.notna(refreshed_at) else "—"
+    return f"""
+    <section class="event-strip">
+      <div class="event-name"><span>LIVE PRICING BOARD</span><h2>{escape(analyses[0]['event'])}</h2><small>{len(analyses)} fights // {live_books} executable order books</small></div>
+      <div class="top-trade"><span>TOP TRADE</span><b>{top_trade}</b><small>{top_edge} NET EDGE</small></div>
+      <div class="tape-status"><span class="live-dot"></span><b>MARKET LIVE</b><small>AUTO 30S // {refreshed}</small></div>
+    </section>"""
+
+
+def active_positions_strip(rows):
+    """Show frozen paper entries and live progress toward the executable sell target."""
+    positions = [row for row in rows if safe_float(row.get("position_dollars"), 0) > 0]
+    if not positions:
+        return ""
+    cards = []
+    for row in positions:
+        progress = safe_float(row.get("target_progress"))
+        bar_width = max(0, min(100, progress * 100)) if np.isfinite(progress) else 0
+        progress_label = pct(progress, 0) if np.isfinite(progress) else "—"
+        distance = safe_float(row.get("distance_to_target"))
+        if np.isfinite(distance) and distance <= 0:
+            target_note = f"TARGET CLEARED BY {abs(distance):.1%}"
+        elif np.isfinite(distance):
+            target_note = f"{distance:.1%} TO TARGET"
+        else:
+            target_note = "WAITING FOR LIVE BID"
+        entry_time = pd.to_datetime(row.get("entry_timestamp_utc"), utc=True, errors="coerce")
+        timestamp = entry_time.strftime("%b %d // %H:%M UTC") if pd.notna(entry_time) else "ENTRY RECORDED"
+        signal_class = {"SELL": "sell", "HOLD": "hold", "REVIEW": "review"}.get(row.get("signal"), "watch")
+        cards.append(f"""
+        <article class="active-position">
+          <div class="active-position-top"><span class="taken-badge">BET TAKEN</span><i class="position-signal {signal_class}">{escape(row.get('signal', 'WATCH'))}</i></div>
+          <h3>{escape(row['trade_side'])}</h3><small>{escape(row['fight'])}</small>
+          <div class="position-prices">
+            <div><span>ENTRY</span><b>{pct(row['entry_price'])}</b></div>
+            <div><span>LIVE BID</span><b>{pct(row['current_bid'])}</b></div>
+            <div><span>SELL TARGET</span><b>{pct(row['target_price'])}</b></div>
+          </div>
+          <div class="progress-label"><span>TARGET PROGRESS</span><b>{progress_label}</b></div>
+          <div class="target-track"><i style="width:{bar_width:.0f}%"></i></div>
+          <div class="position-foot"><span>{money(row['position_dollars'])} POSITION // {signed_money(row['unrealized_pnl'])} LIVE P&amp;L</span><b>{target_note}</b></div>
+          <div class="entry-stamp">{timestamp}</div>
+        </article>""")
+    return f"""
+    <section class="active-book">
+      <header><div><span>OPEN PAPER POSITIONS</span><h2>RECORDED BETS // LIVE TARGET MONITOR</h2></div><b>{len(positions)} ACTIVE</b></header>
+      <div class="active-grid">{''.join(cards)}</div>
+    </section>"""
 
 
 def convergence_table(rows):
@@ -347,11 +477,11 @@ st.markdown("""
   .brand small { display:block; margin-top:.1rem; color:#85888e; font-size:.5rem; font-weight:800; letter-spacing:.18em; }
   .model-pill { border-left:3px solid var(--red); padding:.32rem 0 .32rem .75rem; color:#c5c7cb; font-size:.57rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase; }
   .model-pill i { width:6px; height:6px; display:inline-block; border-radius:50%; background:var(--red); margin-right:.45rem; box-shadow:0 0 0 3px rgba(225,6,0,.18); }
-  .hero { min-height:250px; display:grid; grid-template-columns:minmax(0,1fr) 190px; align-items:center; gap:3rem; margin:0 -2.35rem 1.2rem; padding:2.35rem; background:#0b0c0e; border-bottom:1px solid var(--line); position:relative; overflow:hidden; }
-  .hero:after { content:""; position:absolute; right:220px; top:-70px; width:9px; height:390px; background:var(--red); transform:rotate(22deg); opacity:.85; }
+  .hero { min-height:176px; display:grid; grid-template-columns:minmax(0,1fr) 190px; align-items:center; gap:3rem; margin:0 -2.35rem 1.1rem; padding:1.75rem 2.35rem; background:#0b0c0e; border-bottom:1px solid var(--line); position:relative; overflow:hidden; }
+  .hero:after { content:""; position:absolute; right:220px; top:-90px; width:9px; height:360px; background:var(--red); transform:rotate(22deg); opacity:.85; }
   .hero-copy { min-width:0; position:relative; z-index:1; }
   .hero .eyebrow { display:block; margin:0 0 .7rem; color:var(--red); font-size:.62rem; font-weight:950; font-style:italic; letter-spacing:.22em; }
-  .hero h1 { position:static; display:block; margin:0; max-width:960px; color:var(--white); font-size:clamp(2.8rem,5.6vw,5.4rem); font-weight:950; font-style:italic; text-transform:uppercase; line-height:.88; letter-spacing:-.055em; }
+  .hero h1 { position:static; display:block; margin:0; max-width:960px; color:var(--white); font-size:clamp(2.25rem,4.4vw,4.35rem); font-weight:950; font-style:italic; text-transform:uppercase; line-height:.88; letter-spacing:-.055em; }
   .hero h1 em { color:var(--red); font-style:inherit; }
   .hero .hero-sub { display:block; margin-top:1.25rem; color:#b0b2b7; font-size:.68rem; font-weight:800; letter-spacing:.16em; text-transform:uppercase; }
   .holdout { min-width:160px; position:relative; z-index:1; border-top:4px solid var(--red); border-bottom:1px solid #45474c; padding:.85rem .15rem .75rem; }
@@ -377,6 +507,71 @@ st.markdown("""
   .board-title { margin:1rem 0 0; padding:.9rem 1.05rem; background:#0e0f11; border:1px solid var(--line); border-left:5px solid var(--red); border-bottom:0; }
   .board-title small { color:var(--red); font-size:.52rem; font-weight:950; font-style:italic; letter-spacing:.18em; }
   .board-title h2 { margin:.2rem 0 0; color:#fff; font-size:1.12rem; font-weight:950; font-style:italic; text-transform:uppercase; }
+  .event-strip { margin:1rem 0 0; display:grid; grid-template-columns:minmax(0,1.7fr) minmax(220px,.85fr) 230px; background:#0e0f11; border:1px solid var(--line); border-left:7px solid var(--red); }
+  .event-strip>div { min-height:94px; padding:1rem 1.1rem; display:flex; flex-direction:column; justify-content:center; border-right:1px solid var(--line); }
+  .event-strip>div:last-child { border-right:0; }
+  .event-strip span,.event-strip small { color:#7f8288; font-size:.5rem; font-weight:900; letter-spacing:.14em; text-transform:uppercase; }
+  .event-strip h2 { margin:.18rem 0; color:#fff; font-size:1.45rem; font-weight:950; font-style:italic; text-transform:uppercase; line-height:1; }
+  .event-strip b { margin:.2rem 0; color:#fff; font-size:.92rem; font-weight:950; text-transform:uppercase; }
+  .top-trade { background:#151618; }
+  .top-trade small { color:#ff3932; }
+  .tape-status { align-items:flex-start; }
+  .tape-status b { color:#fff; font-size:.75rem; }
+  .live-dot { width:8px; height:8px; margin-bottom:.35rem; background:var(--red); border-radius:50%; box-shadow:0 0 0 4px rgba(225,6,0,.14); }
+  .active-book { margin:1rem 0 1.2rem; border:1px solid var(--line); background:#0d0e10; }
+  .active-book>header { min-height:70px; padding:.9rem 1.1rem; display:flex; align-items:center; justify-content:space-between; gap:1rem; border-left:7px solid var(--red); border-bottom:1px solid var(--line); }
+  .active-book>header span { color:var(--red); font-size:.5rem; font-weight:950; font-style:italic; letter-spacing:.18em; }
+  .active-book>header h2 { margin:.2rem 0 0; color:#fff; font-size:1.08rem; font-weight:950; font-style:italic; letter-spacing:.02em; text-transform:uppercase; }
+  .active-book>header>b { padding:.5rem .7rem; color:#fff; background:var(--red); font-size:.58rem; font-weight:950; letter-spacing:.12em; white-space:nowrap; }
+  .active-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .active-position { min-width:0; padding:1rem 1.05rem; border-right:1px solid var(--line); border-bottom:1px solid var(--line); background:#111214; }
+  .active-position:nth-child(3n) { border-right:0; }
+  .active-position-top { display:flex; align-items:center; justify-content:space-between; gap:.75rem; }
+  .taken-badge { padding:.3rem .48rem; background:var(--red); color:#fff; font-size:.48rem; font-weight:950; font-style:italic; letter-spacing:.12em; }
+  .position-signal { padding:.28rem .45rem; border:1px solid #4d5056; color:#fff; font-size:.48rem; font-weight:950; font-style:normal; letter-spacing:.1em; }
+  .position-signal.sell { background:#fff; border-color:#fff; color:#090a0c; }
+  .position-signal.review { background:var(--amber); border-color:var(--amber); color:#090a0c; }
+  .position-signal.watch { color:#8d9096; }
+  .active-position h3 { margin:.8rem 0 .1rem; color:#fff; font-size:1rem; font-weight:950; font-style:italic; text-transform:uppercase; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .active-position>small { display:block; min-height:1.8rem; color:#777a80; font-size:.5rem; font-weight:800; text-transform:uppercase; }
+  .position-prices { margin:.7rem 0; display:grid; grid-template-columns:repeat(3,1fr); border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+  .position-prices>div { padding:.58rem .45rem; border-right:1px solid var(--line); }
+  .position-prices>div:first-child { padding-left:0; }
+  .position-prices>div:last-child { padding-right:0; border-right:0; }
+  .position-prices span,.progress-label span { display:block; color:#777a80; font-size:.45rem; font-weight:950; letter-spacing:.1em; }
+  .position-prices b { display:block; margin-top:.12rem; color:#fff; font-size:1rem; font-weight:950; font-style:italic; font-variant-numeric:tabular-nums; }
+  .position-prices>div:nth-child(2) b { color:#ff3932; }
+  .progress-label { display:flex; align-items:center; justify-content:space-between; }
+  .progress-label b { color:#fff; font-size:.68rem; font-weight:950; font-style:italic; }
+  .target-track { height:7px; margin:.35rem 0 .55rem; overflow:hidden; background:#292b2f; }
+  .target-track i { display:block; height:100%; background:var(--red); }
+  .position-foot { display:flex; justify-content:space-between; gap:.8rem; color:#9b9ea4; font-size:.48rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
+  .position-foot b { color:#fff; text-align:right; }
+  .entry-stamp { margin-top:.45rem; color:#5e6167; font-size:.44rem; font-weight:900; letter-spacing:.08em; }
+  .fight-board { border-left:1px solid var(--line); border-right:1px solid var(--line); }
+  .fight-row { min-height:112px; display:grid; grid-template-columns:58px minmax(270px,1.55fr) minmax(210px,1.15fr) 105px 112px 112px 150px; align-items:stretch; background:#111214; border-bottom:1px solid var(--line); }
+  .fight-row:nth-child(even) { background:#151619; }
+  .fight-row>div { min-width:0; padding:.9rem .85rem; display:flex; flex-direction:column; justify-content:center; border-right:1px solid var(--line); }
+  .fight-row>div:last-child { border-right:0; }
+  .bout-id { align-items:center; background:#0b0c0e; }
+  .bout-id span,.trade-side span,.price-cell span { color:#777a80; font-size:.48rem; font-weight:950; letter-spacing:.13em; text-transform:uppercase; }
+  .bout-id b { color:#5e6167; font-size:1.05rem; font-style:italic; }
+  .matchup strong { color:#fff; font-size:.82rem; font-weight:950; text-transform:uppercase; line-height:1.1; }
+  .matchup i { margin:.18rem 0; color:var(--red); font-size:.5rem; font-weight:950; font-style:italic; }
+  .matchup small,.trade-side small,.price-cell small { margin-top:.45rem; color:#777a80; font-size:.5rem; font-weight:800; line-height:1.3; text-transform:uppercase; }
+  .trade-side b { margin-top:.28rem; color:#f1f1ee; font-size:.72rem; font-weight:950; text-transform:uppercase; }
+  .trade-side small { max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .price-cell { text-align:right; align-items:flex-end; }
+  .price-cell b { margin-top:.16rem; color:#fff; font-size:1.25rem; font-weight:950; font-style:italic; font-variant-numeric:tabular-nums; }
+  .price-cell.live span i { width:6px; height:6px; display:inline-block; margin-right:.35rem; border-radius:50%; background:var(--red); }
+  .price-cell.edge b { color:#ff3932; }
+  .fight-action { align-items:center; text-align:center; }
+  .fight-action span { width:100%; padding:.55rem .4rem; color:#fff; font-size:.78rem; font-weight:950; font-style:italic; letter-spacing:.12em; text-transform:uppercase; }
+  .fight-action b { margin-top:.45rem; color:#85888e; font-size:.48rem; font-weight:900; letter-spacing:.08em; }
+  .bet-card .fight-action { background:var(--red); }
+  .bet-card .fight-action span,.bet-card .fight-action b { color:#fff; }
+  .pass-card .fight-action { background:#202226; }
+  .pass-card .fight-action span { color:#a0a3a9; }
   .pricing-table-wrap { overflow-x:auto; background:#111214; border:1px solid var(--line); }
   .pricing-table { width:100%; min-width:1180px; border-collapse:collapse; }
   .pricing-table th { padding:.66rem .72rem; text-align:left; background:var(--red); color:#fff; border-right:1px solid rgba(255,255,255,.16); font-size:.5rem; font-weight:950; letter-spacing:.12em; text-transform:uppercase; }
@@ -402,11 +597,14 @@ st.markdown("""
   [data-testid="stDataFrame"], [data-testid="stVegaLiteChart"] { border:1px solid var(--line); }
   .stCaptionContainer, [data-testid="stCaptionContainer"] { color:#85888e!important; }
   .fineprint { margin-top:1.6rem; padding-top:.8rem; border-top:1px solid var(--line); color:#5f6268; font-size:.55rem; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
-  @media(max-width:700px){.block-container{padding:1rem}.brandbar{margin:-1rem -1rem 0;padding:.85rem 1rem}.model-pill,.holdout,.hero:after{display:none}.hero{display:block;min-height:0;margin:0 -1rem 1rem;padding:2rem 1rem}.hero h1{font-size:3rem}.hero .hero-sub{line-height:1.55}.stTabs [data-baseweb="tab"]{padding:0 .55rem}.formula-row{grid-template-columns:1fr}}
+  @media(max-width:1100px){.active-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.active-position:nth-child(3n){border-right:1px solid var(--line)}.active-position:nth-child(2n){border-right:0}.fight-row{grid-template-columns:48px minmax(230px,1.4fr) minmax(190px,1fr) 90px 100px 105px 125px}.event-strip{grid-template-columns:1fr 1fr}.tape-status{grid-column:1/-1;border-top:1px solid var(--line)}}
+  @media(max-width:700px){.block-container{padding:1rem}.brandbar{margin:-1rem -1rem 0;padding:.85rem 1rem}.model-pill,.holdout,.hero:after{display:none}.hero{display:block;min-height:0;margin:0 -1rem 1rem;padding:1.6rem 1rem}.hero h1{font-size:2.65rem}.hero .hero-sub{line-height:1.55}.stTabs [data-baseweb="tab"]{padding:0 .55rem}.formula-row{grid-template-columns:1fr}.event-strip{display:block}.event-strip>div{min-height:76px;border-right:0;border-bottom:1px solid var(--line)}.active-grid{display:block}.active-position{border-right:0}.active-book>header h2{font-size:.9rem}.fight-row{display:grid;grid-template-columns:44px 1fr 104px}.fight-row .bout-id{grid-row:1/3}.fight-row .matchup{grid-column:2}.fight-row .trade-side{grid-column:2;grid-row:2}.fight-row .price-cell{display:none}.fight-row .fight-action{grid-column:3;grid-row:1/3}}
 </style>
 """, unsafe_allow_html=True)
 
 bundle, fighters = assets()
+if "log" not in st.session_state:
+    st.session_state["log"] = reconcile_paper_results(load_prediction_log(STATE_DIR))
 st.markdown("""
 <div class="brandbar"><div class="brand"><span class="brand-mark">UE</span><div><b>UFC EDGE</b><small>MODEL // MARKET // EXECUTION</small></div></div><div class="model-pill"><i></i> LIVE CLOB // MODEL ONLINE</div></div>
 """, unsafe_allow_html=True)
@@ -425,6 +623,7 @@ with st.sidebar:
     minimum_exit_return = st.slider("Minimum return before sell", min_value=0.00, max_value=0.25, value=0.03, step=0.01)
     stop_loss = st.slider("Loss review threshold", min_value=0.05, max_value=0.40, value=0.15, step=0.05)
     market_mode = st.selectbox("Market source", ["Polymarket CLOB only", "Best available / manual"])
+    auto_refresh = st.checkbox("Auto-refresh live prices every 30 seconds", value=True)
     refresh_results = st.checkbox("Check completed results", value=False)
     manual_odds = st.text_area("Manual odds override", placeholder="Islam Makhachev, -320\nIan Machado Garry, +250", height=90)
     use_research = st.checkbox("Use capped research overlay", value=False)
@@ -442,7 +641,11 @@ if selected_event.startswith("CUSTOM"):
 else:
     event_search = option_values[selected_event]
 
-if run:
+auto_requested = bool(st.session_state.pop("_auto_refresh_requested", False))
+if auto_requested:
+    event_search = st.session_state.get("active_event_search", event_search)
+
+if run or auto_requested:
     started = time.perf_counter()
     try:
         if not event_search:
@@ -459,6 +662,7 @@ if run:
                 polymarket_only=market_mode == "Polymarket CLOB only",
             )
             log = update_prediction_log(STATE_DIR, analyses)
+            log = reconcile_paper_results(log)
             market_history = update_market_history(STATE_DIR, analyses)
             token_ids = tuple(sorted({
                 str(token)
@@ -481,9 +685,16 @@ if run:
         st.session_state["convergence"] = convergence
         st.session_state["market_mode"] = market_mode
         st.session_state["elapsed"] = time.perf_counter() - started
+        st.session_state["active_event_search"] = event_search
+        st.session_state["live_active"] = True
+        st.session_state["_last_auto_refresh_tick"] = time.monotonic()
         st.session_state["excel"] = build_excel(
             analyses, bundle, log, bankroll, event_search,
             cost_buffer=cost_buffer, min_edge=min_edge, min_prior_fights=int(min_fights),
+            convergence=convergence, max_card_exposure=max_card_exposure,
+            capture_target=capture_target, minimum_exit_return=minimum_exit_return,
+            stop_loss=stop_loss,
+            convergence_rows=convergence_rows, market_history=market_history,
         )
     except Exception as exc:
         st.error(str(exc))
@@ -499,21 +710,26 @@ else:
     top_edge = max(valid_edges) if valid_edges else np.nan
     total_risk = sum(row["position_dollars"] for row in bets)
     poly_count = sum(row["market_source"] == "Polymarket CLOB" for row in analyses)
-    st.markdown(f"<div class='statusline'><b>MARKET SYNC</b> // {st.session_state['elapsed']:.2f}s // {len(analyses)} fights // {poly_count} live order books // {escape(st.session_state['market_mode'])}</div>", unsafe_allow_html=True)
+    convergence_rows = st.session_state.get("convergence_rows", [])
+    st.markdown(event_strip(analyses), unsafe_allow_html=True)
+    st.markdown(f"<div class='statusline'><b>SYNCED</b> // {st.session_state['elapsed']:.2f}s // EXECUTABLE ASK DRIVES ENTRY // EXECUTABLE BID DRIVES EXIT // {escape(st.session_state['market_mode'])}</div>", unsafe_allow_html=True)
     metric_columns = st.columns(4)
     metric_columns[0].metric("Bets", len(bets), f"{len(analyses)} fights screened")
     metric_columns[1].metric("Top edge", pct(top_edge), "net of buffer")
     metric_columns[2].metric("Card risk", money(total_risk), f"{total_risk / bankroll:.1%} of bankroll")
     metric_columns[3].metric("Backtest", f"{bundle['metrics']['accuracy']:.1%}", f"{bundle['metrics']['holdout_fights']:,} unseen fights")
+    active_strip = active_positions_strip(convergence_rows)
+    if active_strip:
+        st.markdown(active_strip, unsafe_allow_html=True)
 
-    dashboard_tab, convergence_tab, model_tab, raw_tab, performance_tab, history_tab = st.tabs(["Fight Board", "Positions", "Model Math", "Raw Data", "Track Record", "Log"])
+    dashboard_tab, convergence_tab, performance_tab, model_tab, raw_tab, history_tab = st.tabs(["Fight Board", "Positions", "Backtester", "Model Math", "Raw Data", "Audit Log"])
     with dashboard_tab:
-        st.markdown(f"<div class='board-title'><small>LIVE FIGHT BOARD</small><h2>{escape(analyses[0]['event'])}</h2></div>{dashboard_table(analyses)}", unsafe_allow_html=True)
-        st.caption("*EXIT TARGET = LIVE ASK + ASSUMED CONVERGENCE TOWARD MODEL FAIR VALUE.")
+        st.markdown(fight_board(analyses, convergence_rows), unsafe_allow_html=True)
+        with st.expander("Detailed pricing table"):
+            st.markdown(dashboard_table(analyses), unsafe_allow_html=True)
         filename = re.sub(r"[^a-z0-9]+", "_", event_search.lower()).strip("_") or "ufc"
-        st.download_button("Download Excel report", st.session_state["excel"], file_name=f"{filename}_edge_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Download detailed Excel", st.session_state["excel"], file_name=f"{filename}_edge_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with convergence_tab:
-        convergence_rows = st.session_state.get("convergence_rows", [])
         positions = [row for row in convergence_rows if row["position_dollars"] > 0]
         sell_signals = [row for row in positions if row["signal"] == "SELL"]
         gaps = [row["gap_closed"] for row in convergence_rows if np.isfinite(row["gap_closed"])]
@@ -594,17 +810,69 @@ else:
                 st.caption("This chart tests the convergence thesis using snapshots recorded by this app. It does not assume convergence occurred.")
     with performance_tab:
         realized = realized_metrics(log)
+        paper = log[log["action"] == "BET"].copy() if len(log) else pd.DataFrame()
+        open_paper = paper[paper["status"] == "OPEN"].copy() if len(paper) else pd.DataFrame()
+        completed_paper = paper[paper["status"] == "COMPLETED"].copy() if len(paper) else pd.DataFrame()
+        paper_metrics = st.columns(6)
+        paper_metrics[0].metric("Open bets", realized["open"])
+        paper_metrics[1].metric("Settled", realized["graded"])
+        paper_metrics[2].metric("Wins", realized["wins"])
+        paper_metrics[3].metric("Losses", realized["losses"])
+        paper_metrics[4].metric("Win rate", pct(realized["win_rate"]))
+        paper_metrics[5].metric("Realized P&L", money(realized["pnl"]))
+        st.markdown("<div class='board-title'><small>PAPER LEDGER</small><h2>EVERY BET SIGNAL IS RECORDED AT THE FIRST LIVE ASK</h2></div>", unsafe_allow_html=True)
+        if len(open_paper):
+            st.markdown("#### Open paper bets")
+            open_paper["fight"] = open_paper["fighter_a"] + " vs " + open_paper["fighter_b"]
+            open_columns = ["entry_timestamp_utc", "event", "fight", "pick", "model_probability", "entry_price", "net_edge", "position_dollars", "potential_profit", "status"]
+            st.dataframe(open_paper[[column for column in open_columns if column in open_paper.columns]], width="stretch", hide_index=True, column_config={
+                "model_probability": st.column_config.NumberColumn("Model P", format="percent"),
+                "entry_price": st.column_config.NumberColumn("Entry Price", format="percent"),
+                "net_edge": st.column_config.NumberColumn("Net Edge", format="percent"),
+                "position_dollars": st.column_config.NumberColumn("Stake", format="dollar"),
+                "potential_profit": st.column_config.NumberColumn("Profit If Win", format="dollar"),
+            })
+        else:
+            st.info("No open paper bets. A row is added automatically the first time a fight qualifies as BET.")
+        if len(completed_paper):
+            st.markdown("#### Completed paper bets")
+            completed_paper["fight"] = completed_paper["fighter_a"] + " vs " + completed_paper["fighter_b"]
+            completed_paper = completed_paper.sort_values("settled_timestamp_utc", ascending=False)
+            completed_columns = ["event_date", "fight", "pick", "winner", "entry_price", "position_dollars", "outcome", "return_pct", "pnl", "exit_type"]
+            st.dataframe(completed_paper[[column for column in completed_columns if column in completed_paper.columns]], width="stretch", hide_index=True, column_config={
+                "entry_price": st.column_config.NumberColumn("Entry Price", format="percent"),
+                "position_dollars": st.column_config.NumberColumn("Stake", format="dollar"),
+                "return_pct": st.column_config.NumberColumn("Return", format="percent"),
+                "pnl": st.column_config.NumberColumn("P&L", format="dollar"),
+            })
+            curve = completed_paper.copy()
+            curve["settled_timestamp_utc"] = pd.to_datetime(curve["settled_timestamp_utc"], utc=True, errors="coerce")
+            curve["pnl"] = pd.to_numeric(curve["pnl"], errors="coerce").fillna(0)
+            curve = curve.dropna(subset=["settled_timestamp_utc"]).sort_values("settled_timestamp_utc")
+            if len(curve):
+                curve["Cumulative P&L"] = curve["pnl"].cumsum()
+                st.line_chart(curve.set_index("settled_timestamp_utc")[["Cumulative P&L"]], color="#E10600", height=270)
+        else:
+            st.caption("Completed bets will appear here after the official UFC result is published and the app refreshes.")
+        st.download_button(
+            "Download paper ledger CSV", log.to_csv(index=False).encode("utf-8"),
+            file_name="ufc_paper_trade_ledger.csv", mime="text/csv",
+        )
+        with st.expander("Restore a prior paper ledger"):
+            ledger_file = st.file_uploader("Paper ledger CSV", type=["csv"], key="paper_ledger_restore")
+            if ledger_file is not None and st.button("Restore ledger", key="restore_ledger_button"):
+                try:
+                    restored = merge_prediction_log(STATE_DIR, pd.read_csv(io.BytesIO(ledger_file.getvalue())))
+                    st.session_state["log"] = reconcile_paper_results(restored)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Ledger could not be restored: {exc}")
+        st.markdown("<div class='board-title'><small>FROZEN MODEL TEST</small><h2>UNSEEN HISTORICAL FIGHTS</h2></div>", unsafe_allow_html=True)
         columns = st.columns(4)
         columns[0].metric("Unseen holdout", f"{bundle['metrics']['holdout_fights']:,}")
         columns[1].metric("Accuracy", f"{bundle['metrics']['accuracy']:.1%}")
         columns[2].metric("Brier score", f"{bundle['metrics']['brier']:.3f}")
         columns[3].metric("ROC AUC", f"{bundle['metrics']['auc']:.3f}")
-        live = st.columns(4)
-        live[0].metric("Recorded bets", realized["graded"])
-        live[1].metric("Wins", realized["wins"])
-        live[2].metric("Losses", realized["losses"])
-        live[3].metric("Recorded P&L", money(realized["pnl"]))
-        st.caption("The 2025–2026 holdout was not used to train or calibrate the model.")
     with history_tab:
         prediction_history, price_history = st.tabs(["Predictions", "Market snapshots"])
         with prediction_history:
@@ -620,4 +888,19 @@ else:
             else:
                 st.info("No market snapshots recorded yet.")
 
+
+@st.fragment(run_every=30)
+def live_refresh_clock():
+    """Trigger a full market reprice every 30 seconds while a card is active."""
+    if not auto_refresh or not st.session_state.get("live_active"):
+        return
+    now = time.monotonic()
+    last = float(st.session_state.get("_last_auto_refresh_tick", now))
+    if now - last >= 25:
+        st.session_state["_last_auto_refresh_tick"] = now
+        st.session_state["_auto_refresh_requested"] = True
+        st.rerun()
+
+
+live_refresh_clock()
 st.markdown(f"<div class='fineprint'>{bundle['version']} // RESEARCH MODEL // PROBABILITIES ARE ESTIMATES, NOT GUARANTEES</div>", unsafe_allow_html=True)

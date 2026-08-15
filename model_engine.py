@@ -8,7 +8,7 @@ import re
 import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -702,13 +702,167 @@ def analyze_card(card, market_rows, bundle, fighters, bankroll=10_000, research_
 LOG_COLUMNS = [
     "prediction_id", "timestamp_utc", "event_date", "event", "fighter_a", "fighter_b",
     "pick", "model_probability", "market_probability", "net_edge", "action",
-    "position_dollars", "status", "winner", "outcome", "pnl", "model_version",
+    "position_dollars", "entry_timestamp_utc", "entry_price", "entry_odds",
+    "potential_profit", "status", "winner", "outcome", "settled_timestamp_utc",
+    "exit_type", "exit_price", "return_pct", "pnl", "closing_reason", "model_version",
+]
+
+LOG_TEXT_COLUMNS = [
+    "prediction_id", "timestamp_utc", "event_date", "event", "fighter_a", "fighter_b",
+    "pick", "action", "entry_timestamp_utc", "status", "winner", "outcome",
+    "settled_timestamp_utc", "exit_type", "closing_reason", "model_version",
+]
+
+LOG_NUMERIC_COLUMNS = [
+    "model_probability", "market_probability", "net_edge", "position_dollars",
+    "entry_price", "entry_odds", "potential_profit", "exit_price", "return_pct", "pnl",
 ]
 
 MARKET_HISTORY_COLUMNS = [
     "timestamp_utc", "event", "fighter_a", "fighter_b", "trade_side",
     "model_probability", "live_bid", "live_ask", "exit_target", "market_source",
 ]
+
+
+def normalize_prediction_log(log):
+    """Upgrade older ledgers in place while preserving every recorded entry."""
+    log = log.copy() if isinstance(log, pd.DataFrame) else pd.DataFrame()
+    for column in LOG_COLUMNS:
+        if column not in log.columns:
+            log[column] = "" if column in LOG_TEXT_COLUMNS else np.nan
+    for column in LOG_TEXT_COLUMNS:
+        log[column] = log[column].fillna("").astype("object")
+    for column in LOG_NUMERIC_COLUMNS:
+        log[column] = pd.to_numeric(log[column], errors="coerce").astype(float)
+    legacy_bets = (log["action"] == "BET") & ~np.isfinite(log["entry_price"])
+    log.loc[legacy_bets, "entry_price"] = log.loc[legacy_bets, "market_probability"]
+    missing_entry_time = legacy_bets & (log["entry_timestamp_utc"] == "")
+    log.loc[missing_entry_time, "entry_timestamp_utc"] = log.loc[missing_entry_time, "timestamp_utc"]
+    missing_profit = legacy_bets & ~np.isfinite(log["potential_profit"])
+    if missing_profit.any():
+        prices = log.loc[missing_profit, "entry_price"]
+        stakes = log.loc[missing_profit, "position_dollars"].fillna(0)
+        valid = prices.between(0.000001, 0.999999)
+        calculated = pd.Series(np.nan, index=prices.index, dtype=float)
+        calculated.loc[valid] = stakes.loc[valid] * (1 / prices.loc[valid] - 1)
+        log.loc[missing_profit, "potential_profit"] = calculated
+    return log[LOG_COLUMNS]
+
+
+def load_prediction_log(state_dir: Path):
+    path = state_dir / "prediction_log.csv"
+    log = pd.read_csv(path) if path.exists() else pd.DataFrame(columns=LOG_COLUMNS)
+    return normalize_prediction_log(log)
+
+
+def merge_prediction_log(state_dir: Path, incoming):
+    """Restore a downloaded ledger without overwriting stronger completed/entered records."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    existing = load_prediction_log(state_dir)
+    incoming = normalize_prediction_log(incoming)
+    combined = pd.concat([existing, incoming], ignore_index=True) if len(existing) else incoming.copy()
+    selected = []
+    for _, group in combined.groupby("prediction_id", sort=False, dropna=False):
+        completed = group[group["status"] == "COMPLETED"]
+        if len(completed):
+            ranked = completed.assign(_time=pd.to_datetime(completed["settled_timestamp_utc"], errors="coerce"))
+            selected.append(ranked.sort_values("_time", na_position="first").iloc[-1].drop(labels=["_time"]))
+            continue
+        entered = group[group["action"] == "BET"]
+        if len(entered):
+            ranked = entered.assign(_time=pd.to_datetime(entered["entry_timestamp_utc"], errors="coerce"))
+            selected.append(ranked.sort_values("_time", na_position="last").iloc[0].drop(labels=["_time"]))
+            continue
+        ranked = group.assign(_time=pd.to_datetime(group["timestamp_utc"], errors="coerce"))
+        selected.append(ranked.sort_values("_time", na_position="first").iloc[-1].drop(labels=["_time"]))
+    merged = normalize_prediction_log(pd.DataFrame(selected))
+    merged.to_csv(state_dir / "prediction_log.csv", index=False)
+    return merged
+
+
+def _settle_prediction_row(log, index, winner, settled_at=None):
+    settled_at = settled_at or datetime.now(timezone.utc).isoformat()
+    row = log.loc[index]
+    action = str(row.get("action") or "")
+    if action == "BET":
+        won = canonical_name(row.get("pick")) == canonical_name(winner)
+        price = safe_float(row.get("entry_price"), safe_float(row.get("market_probability")))
+        stake = safe_float(row.get("position_dollars"), 0)
+        pnl = stake * (1 / price - 1) if won and 0 < price < 1 else -stake
+        outcome = "WIN" if won else "LOSS"
+        exit_price = 1.0 if won else 0.0
+        return_pct = pnl / stake if stake else np.nan
+        reason = f"{winner} won; binary contract settled at {exit_price:.0f}."
+    else:
+        pnl, outcome, exit_price, return_pct = 0.0, "NO BET", np.nan, np.nan
+        reason = f"{winner} won; no paper position was opened."
+    log.at[index, "status"] = "COMPLETED"
+    log.at[index, "winner"] = winner
+    log.at[index, "outcome"] = outcome
+    log.at[index, "settled_timestamp_utc"] = settled_at
+    log.at[index, "exit_type"] = "FIGHT RESULT"
+    log.at[index, "exit_price"] = exit_price
+    log.at[index, "return_pct"] = return_pct
+    log.at[index, "pnl"] = round(pnl, 2)
+    log.at[index, "closing_reason"] = reason
+
+
+def grade_prediction_log(state_dir: Path, completed_bouts):
+    """Settle previously recorded paper positions from official completed bouts."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "prediction_log.csv"
+    log = load_prediction_log(state_dir)
+    result_map = {
+        pair_key(row.get("fighter_a", ""), row.get("fighter_b", "")): row.get("winner", "")
+        for row in completed_bouts or [] if row.get("winner")
+    }
+    if result_map:
+        for index, row in log.loc[log["status"] == "OPEN"].iterrows():
+            winner = result_map.get(pair_key(row["fighter_a"], row["fighter_b"]))
+            if winner:
+                _settle_prediction_row(log, index, winner)
+        log.to_csv(path, index=False)
+    return log
+
+
+def fetch_completed_results_for_log(log, max_events=30):
+    """Find official UFCStats winners for due paper positions without hindsight entries."""
+    log = normalize_prediction_log(log)
+    open_bets = log[(log["status"] == "OPEN") & (log["action"] == "BET")].copy()
+    if open_bets.empty:
+        return []
+    eastern_today = datetime.now(ZoneInfo("America/New_York")).date()
+    event_dates = pd.to_datetime(open_bets["event_date"], errors="coerce")
+    due_mask = event_dates.isna() | (event_dates.dt.date <= eastern_today)
+    due = open_bets.loc[due_mask].copy()
+    if due.empty:
+        return []
+    due_pairs = {pair_key(row["fighter_a"], row["fighter_b"]) for _, row in due.iterrows()}
+    event_names = [canonical_name(value) for value in due["event"].dropna().astype(str)]
+    valid_dates = pd.to_datetime(due["event_date"], errors="coerce").dropna()
+    earliest = valid_dates.min().date() if len(valid_dates) else eastern_today
+    completed = []
+    events = list_ufcstats_events("completed")
+    for event in events[:max_events]:
+        listed_date = pd.to_datetime(event.get("date_text"), errors="coerce")
+        if pd.notna(listed_date) and listed_date.date() < earliest - timedelta(days=3):
+            continue
+        event_name = canonical_name(event.get("event"))
+        name_match = any(fuzz.WRatio(event_name, target) >= 55 for target in event_names)
+        date_match = pd.notna(listed_date) and any(abs((listed_date.date() - value.date()).days) <= 1 for value in valid_dates)
+        if not name_match and not date_match:
+            continue
+        try:
+            card = parse_ufcstats_card(event)
+        except Exception:
+            continue
+        for bout in card:
+            if bout.get("winner") and pair_key(bout["fighter_a"], bout["fighter_b"]) in due_pairs:
+                completed.append(bout)
+                due_pairs.discard(pair_key(bout["fighter_a"], bout["fighter_b"]))
+        if not due_pairs:
+            break
+    return completed
 
 
 def update_market_history(state_dir: Path, analyses):
@@ -739,40 +893,29 @@ def update_market_history(state_dir: Path, analyses):
 def update_prediction_log(state_dir: Path, analyses):
     state_dir.mkdir(parents=True, exist_ok=True)
     path = state_dir / "prediction_log.csv"
-    log = pd.read_csv(path) if path.exists() else pd.DataFrame(columns=LOG_COLUMNS)
-    for column in [
-        "prediction_id", "timestamp_utc", "event_date", "event", "fighter_a", "fighter_b",
-        "pick", "action", "status", "winner", "outcome", "model_version",
-    ]:
-        log[column] = log[column].fillna("").astype("object")
-    for column in ["model_probability", "market_probability", "net_edge", "position_dollars", "pnl"]:
-        log[column] = pd.to_numeric(log[column], errors="coerce").astype(float)
+    log = load_prediction_log(state_dir)
     result_map = {pair_key(row["fighter_a"], row["fighter_b"]): row["winner"] for row in analyses if row.get("winner")}
     for index, row in log.loc[log["status"] == "OPEN"].iterrows():
         winner = result_map.get(pair_key(row["fighter_a"], row["fighter_b"]))
-        if not winner:
-            continue
-        if row["action"] == "BET":
-            won = canonical_name(row["pick"]) == canonical_name(winner)
-            price, stake = safe_float(row["market_probability"]), safe_float(row["position_dollars"], 0)
-            pnl = stake * (1 / price - 1) if won and 0 < price < 1 else -stake
-            outcome = "WIN" if won else "LOSS"
-        else:
-            pnl, outcome = 0, "NO BET"
-        log.at[index, "status"] = "COMPLETED"
-        log.at[index, "winner"] = winner
-        log.at[index, "outcome"] = outcome
-        log.at[index, "pnl"] = round(pnl, 2)
+        if winner:
+            _settle_prediction_row(log, index, winner)
     for row in analyses:
         prediction_id = f"{canonical_name(row['event'])}|{'|'.join(pair_key(row['fighter_a'], row['fighter_b']))}"
+        is_bet = row["action"] == "BET"
+        entry_price = safe_float(row.get("market_probability")) if is_bet else np.nan
+        stake = safe_float(row.get("position_dollars"), 0) if is_bet else 0
+        potential_profit = stake * (1 / entry_price - 1) if is_bet and 0 < entry_price < 1 else np.nan
         record = {
             "prediction_id": prediction_id, "timestamp_utc": row["as_of_utc"],
             "event_date": row["event_date"], "event": row["event"],
             "fighter_a": row["fighter_a"], "fighter_b": row["fighter_b"], "pick": row["pick"],
             "model_probability": row["model_probability"], "market_probability": row["market_probability"],
             "net_edge": row["net_edge"], "action": row["action"], "position_dollars": row["position_dollars"],
-            "status": "COMPLETED" if row.get("winner") else "OPEN", "winner": row.get("winner", ""),
-            "outcome": "", "pnl": 0, "model_version": row["model_version"],
+            "entry_timestamp_utc": row["as_of_utc"] if is_bet else "",
+            "entry_price": entry_price, "entry_odds": price_to_american(entry_price) if is_bet else np.nan,
+            "potential_profit": potential_profit, "status": "OPEN", "winner": "",
+            "outcome": "", "settled_timestamp_utc": "", "exit_type": "", "exit_price": np.nan,
+            "return_pct": np.nan, "pnl": 0, "closing_reason": "", "model_version": row["model_version"],
         }
         completed = ((log.get("prediction_id", pd.Series(dtype=str)) == prediction_id) & (log.get("status", pd.Series(dtype=str)) == "COMPLETED")).any()
         if completed:
@@ -787,21 +930,30 @@ def update_prediction_log(state_dir: Path, analyses):
             existing_action = str(log.at[existing_index, "action"])
             # Preserve the original executable entry price once a BET is recorded.
             # A prior NO BET can become a new entry if the live price later creates an edge.
-            if existing_action != "BET" or record["action"] == "BET" and existing_action == "NO BET":
+            if existing_action != "BET":
                 for key, value in record.items():
                     log.loc[existing_index, key] = value
         else:
             incoming = pd.DataFrame([record], columns=LOG_COLUMNS)
             log = incoming if log.empty else pd.concat([log, incoming], ignore_index=True)
+    log = normalize_prediction_log(log)
     log.to_csv(path, index=False)
     return log
 
 
 def realized_metrics(log):
+    log = normalize_prediction_log(log)
     completed = log[log["status"] == "COMPLETED"] if len(log) else pd.DataFrame()
     bets = completed[completed["action"] == "BET"] if len(completed) else pd.DataFrame()
+    open_bets = log[(log["status"] == "OPEN") & (log["action"] == "BET")] if len(log) else pd.DataFrame()
     wins = int((bets["outcome"] == "WIN").sum()) if len(bets) else 0
     losses = int((bets["outcome"] == "LOSS").sum()) if len(bets) else 0
     staked = float(pd.to_numeric(bets.get("position_dollars", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if len(bets) else 0
     pnl = float(pd.to_numeric(bets.get("pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if len(bets) else 0
-    return {"wins": wins, "losses": losses, "graded": len(bets), "pnl": pnl, "roi": pnl / staked if staked else np.nan}
+    open_risk = float(pd.to_numeric(open_bets.get("position_dollars", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if len(open_bets) else 0
+    return {
+        "wins": wins, "losses": losses, "graded": len(bets), "open": len(open_bets),
+        "pnl": pnl, "roi": pnl / staked if staked else np.nan,
+        "win_rate": wins / len(bets) if len(bets) else np.nan,
+        "staked": staked, "open_risk": open_risk,
+    }
