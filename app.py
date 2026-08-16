@@ -16,14 +16,81 @@ from docx import Document
 from pypdf import PdfReader
 
 from excel_report import build_excel
-from model_engine import (
-    analyze_card, canonical_name, discover_card, discover_event_options, feature_vector,
-    fetch_completed_results_for_log, fetch_market_rows, grade_prediction_log,
-    load_assets, load_prediction_log, local_drivers, mark_prediction_log,
-    merge_prediction_log, pair_key, price_to_american, realized_metrics,
-    repair_prediction_log, safe_float, update_market_history,
-    update_prediction_log,
-)
+import model_engine as engine
+
+
+# Attribute binding avoids a hard startup failure when Streamlit reloads
+# app.py a few seconds before model_engine.py during a GitHub redeploy.
+analyze_card = engine.analyze_card
+canonical_name = engine.canonical_name
+discover_card = engine.discover_card
+discover_event_options = engine.discover_event_options
+feature_vector = engine.feature_vector
+fetch_completed_results_for_log = engine.fetch_completed_results_for_log
+fetch_market_rows = engine.fetch_market_rows
+grade_prediction_log = engine.grade_prediction_log
+load_assets = engine.load_assets
+load_prediction_log = engine.load_prediction_log
+local_drivers = engine.local_drivers
+mark_prediction_log = getattr(engine, "mark_prediction_log", lambda state_dir, rows: load_prediction_log(state_dir))
+merge_prediction_log = engine.merge_prediction_log
+normalize_prediction_log = engine.normalize_prediction_log
+pair_key = engine.pair_key
+price_to_american = engine.price_to_american
+realized_metrics = engine.realized_metrics
+safe_float = engine.safe_float
+update_market_history = engine.update_market_history
+update_prediction_log = engine.update_prediction_log
+
+
+def repair_prediction_log(log):
+    """Use the current ledger repair, with a compatibility path for rolling deploys."""
+    if hasattr(engine, "repair_prediction_log"):
+        return engine.repair_prediction_log(log)
+    work = normalize_prediction_log(log)
+    if work.empty:
+        return work
+    keys, labels = [], []
+    for record in work.to_dict("records"):
+        raw = re.sub(r"\s+", " ", str(record.get("event") or "")).strip()
+        normalized = canonical_name(raw)
+        date = pd.to_datetime(record.get("event_date"), errors="coerce")
+        date_key = date.strftime("%Y-%m-%d") if pd.notna(date) else "undated"
+        numbered = re.search(r"\bufc\s+(\d+)\b", normalized)
+        if numbered:
+            number = numbered.group(1)
+            keys.append(f"ufc-{number}|{date_key}")
+            labels.append("UFC 330: Makhachev vs. Machado Garry" if number == "330" else f"UFC {number}")
+        elif normalized.startswith("ufc fight night"):
+            keys.append(f"ufc-fight-night|{date_key}")
+            labels.append("UFC Fight Night")
+        else:
+            keys.append("")
+            labels.append("")
+    work["_event_key"], work["_event_label"] = keys, labels
+    work["_bout_key"] = ["|".join(pair_key(a, b)) for a, b in zip(work["fighter_a"], work["fighter_b"])]
+    work = work[
+        work["_event_key"].ne("")
+        & work["fighter_a"].astype(str).str.strip().ne("")
+        & work["fighter_b"].astype(str).str.strip().ne("")
+    ].copy()
+    selected = []
+    for (_, _), group in work.groupby(["_event_key", "_bout_key"], sort=False):
+        ranked = group.copy()
+        ranked["_quality"] = (
+            ranked["entry_source"].astype(str).str.contains("recovered pre-fight snapshot", case=False, regex=False).astype(int) * 1000
+            + ranked["status"].eq("COMPLETED").astype(int) * 200
+            + ranked["action"].eq("BET").astype(int) * 40
+            + ranked["entry_price"].notna().astype(int) * 10
+        )
+        row = ranked.sort_values("_quality").iloc[-1].copy()
+        row["event"] = row["_event_label"]
+        row["prediction_id"] = f"{canonical_name(row['event'])}|{row['_bout_key']}"
+        selected.append(row)
+    repaired = pd.DataFrame(selected).drop(
+        columns=["_event_key", "_event_label", "_bout_key", "_quality"], errors="ignore"
+    )
+    return normalize_prediction_log(repaired).reset_index(drop=True)
 
 
 ROOT = Path(__file__).resolve().parent
