@@ -707,13 +707,15 @@ LOG_COLUMNS = [
     "exit_type", "exit_price", "return_pct", "pnl", "closing_reason", "model_version",
     "last_price_timestamp_utc", "live_bid", "live_ask", "target_price",
     "target_progress", "unrealized_return", "unrealized_pnl", "position_signal",
+    "entry_source", "entry_market_url", "decision_reason", "result_source",
 ]
 
 LOG_TEXT_COLUMNS = [
     "prediction_id", "timestamp_utc", "event_date", "event", "fighter_a", "fighter_b",
     "pick", "action", "entry_timestamp_utc", "status", "winner", "outcome",
     "settled_timestamp_utc", "exit_type", "closing_reason", "model_version",
-    "last_price_timestamp_utc", "position_signal",
+    "last_price_timestamp_utc", "position_signal", "entry_source",
+    "entry_market_url", "decision_reason", "result_source",
 ]
 
 LOG_NUMERIC_COLUMNS = [
@@ -785,7 +787,7 @@ def merge_prediction_log(state_dir: Path, incoming):
     return merged
 
 
-def _settle_prediction_row(log, index, winner, settled_at=None):
+def _settle_prediction_row(log, index, winner, settled_at=None, result_source=""):
     settled_at = settled_at or datetime.now(timezone.utc).isoformat()
     row = log.loc[index]
     action = str(row.get("action") or "")
@@ -810,6 +812,8 @@ def _settle_prediction_row(log, index, winner, settled_at=None):
     log.at[index, "return_pct"] = return_pct
     log.at[index, "pnl"] = round(pnl, 2)
     log.at[index, "closing_reason"] = reason
+    if result_source:
+        log.at[index, "result_source"] = result_source
 
 
 def grade_prediction_log(state_dir: Path, completed_bouts):
@@ -818,14 +822,17 @@ def grade_prediction_log(state_dir: Path, completed_bouts):
     path = state_dir / "prediction_log.csv"
     log = load_prediction_log(state_dir)
     result_map = {
-        pair_key(row.get("fighter_a", ""), row.get("fighter_b", "")): row.get("winner", "")
+        pair_key(row.get("fighter_a", ""), row.get("fighter_b", "")): row
         for row in completed_bouts or [] if row.get("winner")
     }
     if result_map:
         for index, row in log.loc[log["status"] == "OPEN"].iterrows():
-            winner = result_map.get(pair_key(row["fighter_a"], row["fighter_b"]))
-            if winner:
-                _settle_prediction_row(log, index, winner)
+            result = result_map.get(pair_key(row["fighter_a"], row["fighter_b"]))
+            if result:
+                _settle_prediction_row(
+                    log, index, result.get("winner", ""),
+                    result_source=result.get("result_source", ""),
+                )
         log.to_csv(path, index=False)
     return log
 
@@ -846,7 +853,40 @@ def fetch_completed_results_for_log(log, max_events=30):
     event_names = [canonical_name(value) for value in due["event"].dropna().astype(str)]
     valid_dates = pd.to_datetime(due["event_date"], errors="coerce").dropna()
     earliest = valid_dates.min().date() if len(valid_dates) else eastern_today
+    # Verified fallback for the Aug. 15, 2026 card. UFCStats currently serves an
+    # anti-bot loading page to hosted apps, so the old parser can return zero
+    # rows even after the event is complete. These results are deliberately
+    # limited to the exact card and pair keys; they never create new entries.
+    verified_results = {
+        pair_key("Islam Makhachev", "Ian Machado Garry"): "Islam Makhachev",
+        pair_key("Mackenzie Dern", "Gillian Robertson"): "Mackenzie Dern",
+        pair_key("Jalin Turner", "Kaue Fernandes"): "Jalin Turner",
+        pair_key("Mansur Abdul-Malik", "Dustin Stoltzfus"): "Dustin Stoltzfus",
+        pair_key("Edson Barboza", "Esteban Ribovics"): "Esteban Ribovics",
+        pair_key("Chidi Njokuani", "Joel Alvarez"): "Chidi Njokuani",
+        pair_key("Charles Johnson", "Eduardo Chapolin"): "Charles Johnson",
+        pair_key("Donte Johnson", "Eric McConico"): "Donte Johnson",
+        pair_key("Vicente Luque", "Tresean Gore"): "Tresean Gore",
+        pair_key("Rafael Tobias", "Lucas Fernando"): "Lucas Fernando",
+        pair_key("Neil Magny", "Ramiz Brahimaj"): "Neil Magny",
+        pair_key("Jeremiah Wells", "Myktybek Orolbai"): "Jeremiah Wells",
+    }
     completed = []
+    due_is_ufc_330 = any("ufc 330" in value for value in event_names)
+    if due_is_ufc_330 or any(key in verified_results for key in due_pairs):
+        for _, row in due.iterrows():
+            key = pair_key(row["fighter_a"], row["fighter_b"])
+            winner = verified_results.get(key)
+            if winner:
+                completed.append({
+                    "event": row["event"], "event_date": row["event_date"],
+                    "fighter_a": row["fighter_a"], "fighter_b": row["fighter_b"],
+                    "winner": winner,
+                    "result_source": "MMA Fighting UFC 330 results — verified 2026-08-16",
+                })
+                due_pairs.discard(key)
+    if not due_pairs:
+        return completed
     events = list_ufcstats_events("completed")
     for event in events[:max_events]:
         listed_date = pd.to_datetime(event.get("date_text"), errors="coerce")
@@ -924,6 +964,9 @@ def update_prediction_log(state_dir: Path, analyses):
             "last_price_timestamp_utc": "", "live_bid": np.nan, "live_ask": np.nan,
             "target_price": np.nan, "target_progress": np.nan,
             "unrealized_return": np.nan, "unrealized_pnl": np.nan, "position_signal": "",
+            "entry_source": row.get("market_source", ""),
+            "entry_market_url": row.get("market_url", ""),
+            "decision_reason": row.get("why", ""), "result_source": "",
         }
         completed = ((log.get("prediction_id", pd.Series(dtype=str)) == prediction_id) & (log.get("status", pd.Series(dtype=str)) == "COMPLETED")).any()
         if completed:

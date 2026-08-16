@@ -140,11 +140,13 @@ def build_excel(
     stop_loss=0.15,
     convergence_rows=None,
     market_history=None,
+    fighters=None,
 ):
     """Create a formula-driven UFC pricing and audit workbook."""
     convergence_rows = convergence_rows or []
     market_history = market_history if isinstance(market_history, pd.DataFrame) else pd.DataFrame()
     prediction_log = prediction_log if isinstance(prediction_log, pd.DataFrame) else pd.DataFrame()
+    fighters = fighters if isinstance(fighters, pd.DataFrame) else pd.DataFrame()
     now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     output = io.BytesIO()
     workbook = xlsxwriter.Workbook(output, {"in_memory": True, "nan_inf_to_errors": True})
@@ -239,15 +241,18 @@ def build_excel(
     dashboard = workbook.add_worksheet("DECISION BOARD")
     _write_title(dashboard, "UFC EDGE — DECISION BOARD", f"{event_search} // generated {now_label}", 7, fmt)
     dashboard.freeze_panes(8, 0)
-    bet_count = sum(row["action"] == "BET" for row in analyses)
+    bet_count = int((prediction_log.get("action", pd.Series(dtype=str)) == "BET").sum()) if len(prediction_log) else 0
     edges = [safe_float(row.get("net_edge")) for row in analyses if np.isfinite(safe_float(row.get("net_edge")))]
     top_edge = max(edges) if edges else np.nan
     card_risk = sum(safe_float(row.get("position_dollars"), 0) for row in analyses if row["action"] == "BET")
+    dashboard_realized = realized_metrics(prediction_log)
+    model_input_columns = [column for column in fighters.columns if column not in {"Fighter", "Canonical"}]
+    data_points = int(len(fighters) * len(model_input_columns))
     cards = [
-        ("A4:B4", "A5:B6", "BET SIGNALS", bet_count, "card_value"),
-        ("C4:D4", "C5:D6", "TOP NET EDGE", top_edge, "card_pct"),
-        ("E4:F4", "E5:F6", "CARD RISK", card_risk, "card_money"),
-        ("G4:H4", "G5:H6", "HOLDOUT ACCURACY", bundle["metrics"]["accuracy"], "card_pct"),
+        ("A4:B4", "A5:B6", "NET MODEL P&L", dashboard_realized["total_pnl"], "card_money"),
+        ("C4:D4", "C5:D6", "SETTLED WIN RATE", dashboard_realized["win_rate"], "card_pct"),
+        ("E4:F4", "E5:F6", "RECORDED BETS", bet_count, "card_value"),
+        ("G4:H4", "G5:H6", "FIGHTER STAT CELLS", data_points, "card_value"),
     ]
     for label_range, value_range, label, value, kind in cards:
         dashboard.merge_range(label_range, label, fmt["card_label"])
@@ -376,15 +381,18 @@ def build_excel(
         convergence_sheet.set_row(row_index, 32)
     if not convergence_rows:
         convergence_sheet.merge_range("A5:P7", "No position records were available when this report was generated. Run the live card at least once to record entries and market history.", fmt["note"])
+        convergence_sheet.hide()
 
     snapshot_rows = market_history.to_dict("records") if len(market_history) else []
-    _table_sheet(workbook, fmt, "MARKET SNAPSHOTS", "UFC EDGE — MARKET SNAPSHOTS", "Each app refresh appends the observed executable bid and ask; these values do not auto-refresh inside a downloaded file", [
+    market_sheet = _table_sheet(workbook, fmt, "MARKET SNAPSHOTS", "UFC EDGE — MARKET SNAPSHOTS", "Each app refresh appends the observed executable bid and ask; these values do not auto-refresh inside a downloaded file", [
         ("Timestamp UTC", "timestamp_utc", 23, "text"), ("Event", "event", 20, "text"),
         ("Fighter A", "fighter_a", 22, "text"), ("Fighter B", "fighter_b", 22, "text"),
         ("Trade Side", "trade_side", 22, "text"), ("Model Fair", "model_probability", 12, "pct"),
         ("Live Bid", "live_bid", 11, "pct"), ("Live Ask", "live_ask", 11, "pct"),
         ("Exit Target", "exit_target", 12, "pct"), ("Market Source", "market_source", 20, "text"),
     ], snapshot_rows)
+    if not snapshot_rows:
+        market_sheet.hide()
 
     # Backtest and live record.
     realized = realized_metrics(prediction_log)
@@ -465,6 +473,8 @@ def build_excel(
         ("Target Progress", "target_progress", 15, "pct"), ("Net Return", "effective_return", 13, "pct"),
         ("Net P&L", "effective_pnl", 13, "money"), ("Status", "track_status", 12, "text"),
         ("Official Winner", "winner", 22, "text"), ("Last Mark UTC", "last_mark_utc", 23, "text"),
+        ("Entry Source", "entry_source", 34, "text"), ("Why", "decision_reason", 46, "wrap"),
+        ("Result Source", "result_source", 44, "wrap"),
     ], track_rows)
     _table_sheet(workbook, fmt, "PREDICTION LOG", "UFC EDGE — PREDICTION LOG", "Entries are recorded before results; completed rows are graded as wins or losses", [
         ("Timestamp UTC", "timestamp_utc", 23, "text"), ("Event Date", "event_date", 14, "date"),
@@ -474,7 +484,64 @@ def build_excel(
         ("Decision", "action", 12, "text"), ("Position $", "position_dollars", 13, "money"),
         ("Status", "status", 12, "text"), ("Winner", "winner", 22, "text"),
         ("Outcome", "outcome", 12, "text"), ("P&L", "pnl", 13, "money"), ("Model Version", "model_version", 18, "text"),
+        ("Entry Source", "entry_source", 34, "text"), ("Decision Reason", "decision_reason", 46, "wrap"),
+        ("Result Source", "result_source", 44, "wrap"),
     ], log_rows)
+
+    # Event-level ledger: one compact line per card, tied to the recorded bets.
+    event_rows = []
+    if len(prediction_log):
+        working = prediction_log.copy()
+        for event_name, group in working.groupby("event", dropna=False):
+            bets_group = group[group["action"] == "BET"]
+            settled_group = bets_group[bets_group["status"] == "COMPLETED"]
+            stake = pd.to_numeric(bets_group.get("position_dollars"), errors="coerce").fillna(0).sum()
+            pnl_value = pd.to_numeric(bets_group.get("pnl"), errors="coerce").fillna(0).sum()
+            wins_value = int((settled_group.get("outcome") == "WIN").sum()) if len(settled_group) else 0
+            losses_value = int((settled_group.get("outcome") == "LOSS").sum()) if len(settled_group) else 0
+            event_rows.append({
+                "event_date": group.get("event_date", pd.Series(dtype=str)).iloc[0] if len(group) else "",
+                "event": event_name, "status": "SETTLED" if len(settled_group) == len(bets_group) and len(bets_group) else "OPEN",
+                "fights": len(group), "bets": len(bets_group), "wins": wins_value, "losses": losses_value,
+                "win_rate": wins_value / len(settled_group) if len(settled_group) else np.nan,
+                "stake": stake, "pnl": pnl_value, "roi": pnl_value / stake if stake else np.nan,
+            })
+    _table_sheet(workbook, fmt, "EVENT HISTORY", "UFC EDGE — EVENT HISTORY", "One line per event; P&L uses the original recorded Polymarket entry price", [
+        ("Event Date", "event_date", 14, "date"), ("Event", "event", 38, "text"),
+        ("Status", "status", 12, "text"), ("Fights Screened", "fights", 15, "int"),
+        ("Bets", "bets", 10, "int"), ("Wins", "wins", 10, "int"), ("Losses", "losses", 10, "int"),
+        ("Win Rate", "win_rate", 12, "pct"), ("Capital Used", "stake", 14, "money"),
+        ("Net P&L", "pnl", 14, "money"), ("ROI", "roi", 12, "pct"),
+    ], event_rows)
+
+    # The workbook carries the complete fighter snapshot used for live feature
+    # construction. This is intentionally a dense audit tab, not a dashboard.
+    fighter_rows = fighters.drop(columns=["Canonical"], errors="ignore").to_dict("records") if len(fighters) else []
+    _table_sheet(workbook, fmt, "FIGHTER DATABASE", "UFC EDGE — FIGHTER DATABASE", f"{len(fighter_rows):,} fighter snapshots // {data_points:,} populated stat fields carried into the model", [
+        ("Fighter", "Fighter", 26, "text"), ("UFC Fights", "UFC fights", 12, "int"),
+        ("Wins", "Wins", 9, "int"), ("Losses", "Losses", 9, "int"), ("Draws", "Draws", 9, "int"),
+        ("Opponent-adjusted Elo", "Elo", 19, "num"), ("Smoothed Win %", "Smoothed win %", 16, "pct"),
+        ("Recent 5", "Recent 5", 12, "pct"), ("Adj Strike Diff / Min", "Adj strike diff/min", 19, "num"),
+        ("Adj TD Diff / 15", "Adj TD diff/15", 17, "num"), ("Adj Control Min / 15", "Adj control min/15", 20, "num"),
+        ("Reach", "Reach", 10, "num"), ("Age", "Age", 10, "num"), ("Last Fight", "Last fight", 14, "date"),
+    ], fighter_rows)
+
+    dictionary_rows = [
+        {"field":"UFC fights", "unit":"count", "meaning":"Completed UFC bouts included before the prediction date", "model_use":"Experience screen"},
+        {"field":"Elo", "unit":"rating", "meaning":"Opponent-adjusted sequential strength rating", "model_use":"Elo difference"},
+        {"field":"Smoothed win %", "unit":"probability", "meaning":"UFC record shrunk toward 50% for small samples", "model_use":"Record difference"},
+        {"field":"Recent 5", "unit":"probability", "meaning":"Win rate across the fighter's five most recent eligible UFC bouts", "model_use":"Recent-form difference"},
+        {"field":"Adj strike diff/min", "unit":"strikes/min", "meaning":"Opponent-adjusted significant-strike margin per minute", "model_use":"Striking difference"},
+        {"field":"Adj TD diff/15", "unit":"takedowns/15 min", "meaning":"Opponent-adjusted takedown margin per 15 minutes", "model_use":"Takedown difference"},
+        {"field":"Adj control min/15", "unit":"minutes/15 min", "meaning":"Opponent-adjusted control-time margin per 15 minutes", "model_use":"Control difference"},
+        {"field":"Reach", "unit":"inches", "meaning":"Listed reach", "model_use":"Reach difference"},
+        {"field":"Age", "unit":"years", "meaning":"Age at the model snapshot", "model_use":"Age advantage"},
+        {"field":"Market price", "unit":"probability", "meaning":"Executable Polymarket ask at the recorded entry", "model_use":"Net edge and settlement P&L"},
+    ]
+    _table_sheet(workbook, fmt, "DATA DICTIONARY", "UFC EDGE — DATA DICTIONARY", "Plain-English definitions for the raw model fields", [
+        ("Field", "field", 25, "text"), ("Unit", "unit", 20, "text"),
+        ("What It Means", "meaning", 58, "wrap"), ("How the Model Uses It", "model_use", 32, "wrap"),
+    ], dictionary_rows)
 
     # Automated workbook checks.
     checks = workbook.add_worksheet("CHECKS")
