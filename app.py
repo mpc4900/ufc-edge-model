@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import time
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -14,10 +17,11 @@ from pypdf import PdfReader
 
 from excel_report import build_excel
 from model_engine import (
-    analyze_card, discover_card, discover_event_options, feature_vector,
+    analyze_card, canonical_name, discover_card, discover_event_options, feature_vector,
     fetch_completed_results_for_log, fetch_market_rows, grade_prediction_log,
-    load_assets, load_prediction_log, local_drivers, merge_prediction_log,
-    price_to_american, realized_metrics, safe_float, update_market_history,
+    load_assets, load_prediction_log, local_drivers, mark_prediction_log,
+    merge_prediction_log, pair_key, price_to_american, realized_metrics,
+    repair_prediction_log, safe_float, update_market_history,
     update_prediction_log,
 )
 
@@ -56,14 +60,14 @@ def assets():
     return load_assets(DATA_DIR)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def active_event_options():
     # UFC 330 remains an offline engine example but is now a settled event.
     return [item for item in discover_event_options() if item.get("value") != "UFC 330"]
 
 
-@st.cache_data(ttl=30, show_spinner=False)
 def market_rows(card_json, manual_odds):
+    """Always request a fresh executable order-book snapshot."""
     card = pd.read_json(io.StringIO(card_json)).to_dict("records")
     return fetch_market_rows(card, manual_odds)
 
@@ -79,6 +83,8 @@ def seed_and_grade_ledger():
     log = load_prediction_log(STATE_DIR)
     if SEED_LOG.exists():
         log = merge_prediction_log(STATE_DIR, pd.read_csv(SEED_LOG))
+    log = repair_prediction_log(log)
+    log.to_csv(STATE_DIR / "prediction_log.csv", index=False)
     open_rows = log[(log["action"] == "BET") & (log["status"] == "OPEN")]
     if len(open_rows):
         columns = ["prediction_id", "event_date", "event", "fighter_a", "fighter_b", "action", "status"]
@@ -88,6 +94,8 @@ def seed_and_grade_ledger():
                 log = grade_prediction_log(STATE_DIR, completed)
         except Exception:
             pass
+    log = repair_prediction_log(log)
+    log.to_csv(STATE_DIR / "prediction_log.csv", index=False)
     return log
 
 
@@ -131,6 +139,54 @@ def event_groups(log):
             "status": "SETTLED" if len(bets) and len(settled) == len(bets) else "OPEN",
         })
     return sorted(groups, key=lambda row: row["date"] if pd.notna(row["date"]) else pd.Timestamp.min, reverse=True)
+
+
+def ui_event_key(name, date_value):
+    date = pd.to_datetime(date_value, errors="coerce")
+    date_key = date.strftime("%Y-%m-%d") if pd.notna(date) else "undated"
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+    numbered = re.search(r"\bufc\s+(\d+)\b", normalized)
+    if numbered:
+        return f"ufc-{numbered.group(1)}|{date_key}"
+    if normalized.startswith("ufc fight night"):
+        return f"ufc-fight-night|{date_key}"
+    return f"{normalized}|{date_key}"
+
+
+def option_event_key(option):
+    bouts = option.get("bouts") or []
+    if bouts:
+        return ui_event_key(bouts[0].get("event"), bouts[0].get("event_date"))
+    value = str(option.get("value") or "")
+    if value.startswith("POLY_CARD::"):
+        raw = value.split("::", 1)[1]
+        name, _, date = raw.partition("|")
+        return ui_event_key(name, date)
+    return ui_event_key(value, "")
+
+
+def event_menu(events, active_options):
+    """One menu entry per event, with an accurate status label."""
+    records = {}
+    for event in events:
+        key = ui_event_key(event["event"], event["date"])
+        date_label = event["date"].strftime("%b %-d") if pd.notna(event["date"]) else "Date pending"
+        records[key] = {
+            "id": f"recorded::{key}", "kind": "recorded", "event": event,
+            "label": f"{event['status']}  /  {event['event']}  /  {date_label}",
+        }
+    for option in active_options:
+        key = option_event_key(option)
+        records[key] = {
+            "id": f"live::{key}", "kind": "live", "option": option,
+            "label": option["label"],
+        }
+    menu = list(records.values())
+    menu.sort(key=lambda item: (
+        0 if item["kind"] == "recorded" and item["event"]["status"] == "SETTLED" else 1,
+        -(item["event"]["date"].value if item["kind"] == "recorded" and pd.notna(item["event"]["date"]) else 0),
+    ))
+    return menu
 
 
 def record_raw_inputs(record, bundle, fighters):
@@ -178,9 +234,11 @@ def kpi_strip(items):
 
 def event_header(event):
     date_label = event["date"].strftime("%B %-d, %Y") if pd.notna(event["date"]) else "Date unavailable"
+    record_value = str(event.get("record_value", f"{event['wins']}-{event['losses']}"))
+    record_label = str(event.get("record_label", "MODEL RECORD"))
     st.markdown(
         f"<section class='event-head'><div><span>{event['status']} / {date_label}</span><h1>{escape(event['event'])}</h1></div>"
-        f"<div class='event-record'><b>{event['wins']}-{event['losses']}</b><span>MODEL RECORD</span></div></section>",
+        f"<div class='event-record'><b>{escape(record_value)}</b><span>{escape(record_label)}</span></div></section>",
         unsafe_allow_html=True,
     )
 
@@ -195,16 +253,18 @@ def bets_table(frame):
     bets["Entry"] = bets["entry_price"]
     bets["Odds"] = bets["entry_price"].map(odds)
     bets["Stake"] = bets["position_dollars"]
-    bets["Result"] = bets["outcome"]
+    bets["Result"] = bets["outcome"].where(bets["outcome"].astype(str).str.strip().ne(""), bets["status"])
     bets["P&L"] = bets["pnl"]
     bets["Why"] = bets["decision_reason"]
+    bets["Price source"] = bets["entry_source"]
     st.dataframe(
-        bets[["Fight", "Bet", "Entry", "Odds", "Stake", "Result", "P&L", "Why"]],
+        bets[["Fight", "Bet", "Entry", "Odds", "Stake", "Result", "P&L", "Price source", "Why"]],
         width="stretch", hide_index=True,
         column_config={
             "Entry": st.column_config.NumberColumn("Polymarket entry", format="percent"),
             "Stake": st.column_config.NumberColumn("Capital", format="dollar"),
             "P&L": st.column_config.NumberColumn("Net P&L", format="dollar"),
+            "Price source": st.column_config.TextColumn(width="medium"),
             "Why": st.column_config.TextColumn("Primary reason", width="large"),
         },
     )
@@ -225,7 +285,7 @@ def math_detail(record, bundle, fighters):
     )
     st.markdown(
         f"<section class='math-panel'><div><span>MODEL FAIR VALUE</span><b>{pct(model_p)}</b></div>"
-        f"<div><span>ENTRY ASK</span><b>{pct(entry)}</b></div><div><span>COST BUFFER</span><b>2.0%</b></div>"
+        f"<div><span>POLYMARKET ENTRY</span><b>{pct(entry)}</b></div><div><span>COST BUFFER</span><b>2.0%</b></div>"
         f"<div><span>NET EDGE</span><b>{pct(edge)}</b></div></section>", unsafe_allow_html=True,
     )
     st.markdown(
@@ -241,15 +301,105 @@ def math_detail(record, bundle, fighters):
             "Probability impact": st.column_config.NumberColumn(format="percent"),
         })
     with right:
-        st.markdown(f"#### Raw inputs / {experience} prior fights on thinner side")
+        st.markdown(f"#### Raw inputs / {experience} prior fights for the lower-experience fighter")
         raw = pd.DataFrame(raw_inputs).rename(columns={"Fighter A": record["fighter_a"], "Fighter B": record["fighter_b"]})
         st.dataframe(raw, width="stretch", hide_index=True)
+
+
+@st.fragment(run_every=30)
+def live_event_board(option, bankroll, min_edge, cost_buffer, min_fights, max_card_exposure, manual_odds, research_texts):
+    """Refresh the public Polymarket CLOB snapshot every 30 seconds."""
+    key_suffix = re.sub(r"[^a-z0-9]+", "-", str(option.get("value") or "live").lower()).strip("-")[-48:]
+    left, right = st.columns([4, 1], vertical_alignment="bottom")
+    with left:
+        custom_fight = st.text_input(
+            "Price one fight instead",
+            placeholder="Fighter A vs Fighter B",
+            key=f"custom-fight-{key_suffix}",
+        )
+    with right:
+        st.button("Refresh now", width="stretch", key=f"refresh-{key_suffix}")
+
+    search = custom_fight.strip() if re.search(r"\s+vs\.?\s+", custom_fight, re.I) else option["value"]
+    try:
+        started = time.perf_counter()
+        card = discover_card(search)
+        rows = market_rows(pd.DataFrame(card).to_json(), manual_odds)
+        current = analyze_card(
+            card, rows, bundle, fighters, bankroll=bankroll,
+            research_texts=research_texts, min_edge=min_edge,
+            cost_buffer=cost_buffer, min_prior_fights=int(min_fights),
+            max_card_exposure=max_card_exposure,
+            polymarket_only=not bool(manual_odds.strip()),
+        )
+        update_prediction_log(STATE_DIR, current)
+        live_log = load_prediction_log(STATE_DIR)
+        marks = []
+        for row in current:
+            prediction_id = f"{canonical_name(row['event'])}|{'|'.join(pair_key(row['fighter_a'], row['fighter_b']))}"
+            match = live_log[
+                (live_log["prediction_id"] == prediction_id)
+                & (live_log["status"] == "OPEN")
+                & (live_log["action"] == "BET")
+            ]
+            if match.empty:
+                continue
+            entry = safe_float(match.iloc[-1].get("entry_price"))
+            stake = safe_float(match.iloc[-1].get("position_dollars"), 0)
+            bid = safe_float(row.get("live_bid"))
+            target = safe_float(row.get("exit_target"))
+            unrealized_return = bid / entry - 1 if 0 < entry < 1 and 0 <= bid <= 1 else np.nan
+            progress = (bid - entry) / (target - entry) if np.isfinite(bid) and target > entry else np.nan
+            signal = "TARGET REACHED" if np.isfinite(bid) and bid >= target else ("MARKED PROFIT" if np.isfinite(unrealized_return) and unrealized_return > 0 else "OPEN")
+            marks.append({
+                "prediction_id": prediction_id, "current_bid": bid,
+                "current_ask": row.get("live_ask"), "target_price": target,
+                "target_progress": float(np.clip(progress, 0, 1)) if np.isfinite(progress) else np.nan,
+                "unrealized_return": unrealized_return,
+                "unrealized_pnl": stake * unrealized_return if np.isfinite(unrealized_return) else np.nan,
+                "signal": signal,
+            })
+        if marks:
+            mark_prediction_log(STATE_DIR, marks)
+        update_market_history(STATE_DIR, current)
+        elapsed = time.perf_counter() - started
+        refreshed = datetime.now(ZoneInfo("America/New_York")).strftime("%b %-d, %-I:%M:%S %p ET")
+        matched = sum(np.isfinite(safe_float(row.get("live_ask"))) for row in current)
+        st.markdown(
+            f"<div class='live-status'><i></i>POLYMARKET CLOB &nbsp; / &nbsp; UPDATED {escape(refreshed)}"
+            f" &nbsp; / &nbsp; {matched} OF {len(card)} FIGHTS PRICED &nbsp; / &nbsp; {elapsed:.2f}s"
+            f" &nbsp; / &nbsp; AUTO-REFRESHES EVERY 30 SECONDS</div>",
+            unsafe_allow_html=True,
+        )
+        live = pd.DataFrame([{
+            "Fight": f"{row['fighter_a']} vs {row['fighter_b']}",
+            "Position": row["trade_side"], "Model fair value": row["model_probability"],
+            "Polymarket ask": row["live_ask"], "Net edge": row["net_edge"],
+            "Decision": row["action"], "Capital": row["position_dollars"],
+            "Reason": row["why"], "Market": row.get("market_url", ""),
+        } for row in current])
+        st.dataframe(
+            live, width="stretch", hide_index=True,
+            column_config={
+                "Model fair value": st.column_config.NumberColumn(format="percent"),
+                "Polymarket ask": st.column_config.NumberColumn(format="percent"),
+                "Net edge": st.column_config.NumberColumn(format="percent"),
+                "Capital": st.column_config.NumberColumn(format="dollar"),
+                "Reason": st.column_config.TextColumn(width="large"),
+                "Market": st.column_config.LinkColumn("Polymarket"),
+            },
+        )
+        if matched == 0:
+            st.warning("No executable Polymarket order books matched this card. No position was recorded from substitute odds.")
+    except Exception as exc:
+        st.error(f"Live price refresh failed: {exc}")
 
 
 st.markdown("""
 <style>
   :root{--red:#d20a0a;--ink:#070707;--line:#2b2b2b;--paper:#f2f2ef;--green:#36b56b}
-  .stApp{background:var(--ink);color:var(--paper)}.stApp,.stApp *{font-family:"Arial Narrow","Roboto Condensed","Helvetica Neue",Arial,sans-serif}
+  .stApp{background:var(--ink);color:var(--paper);font-family:"Arial Narrow","Roboto Condensed","Helvetica Neue",Arial,sans-serif}
+  [data-testid="stIconMaterial"],.material-symbols-rounded{font-family:"Material Symbols Rounded"!important}
   .block-container{max-width:1500px;padding:0 2.5rem 4rem}[data-testid="stHeader"]{background:transparent}[data-testid="stToolbar"]{visibility:hidden}
   .mast{height:66px;margin:0 -2.5rem;display:flex;align-items:center;justify-content:space-between;padding:0 2.5rem;border-bottom:6px solid var(--red);background:#000}
   .mast .wordmark{font-size:1.32rem;font-weight:950;font-style:italic;letter-spacing:-.04em}.mast .wordmark i{color:var(--red);font-style:inherit}
@@ -260,7 +410,7 @@ st.markdown("""
   h3{color:#fff!important;font-size:1rem!important;text-transform:uppercase;letter-spacing:.08em;border-left:4px solid var(--red);padding-left:.65rem}h4{color:#fff!important}div[data-testid="stDataFrame"]{border:1px solid #303030}
   div[data-testid="stSelectbox"] label p,div[data-testid="stTextInput"] label p,div[data-testid="stNumberInput"] label p,div[data-testid="stFileUploader"] label p{color:#8e8e8e;font-size:.58rem;font-weight:900;letter-spacing:.14em;text-transform:uppercase}div[data-baseweb="select"]>div,.stTextInput input,.stNumberInput input{background:#111!important;color:#fff!important;border:1px solid #444!important;border-radius:0!important}.stButton button,.stDownloadButton button{border-radius:0!important;min-height:2.7rem;background:var(--red);color:#fff;border:0;font-size:.64rem;font-weight:950;letter-spacing:.12em;text-transform:uppercase}.stDownloadButton button{background:#151515;border:1px solid #555}
   .section-line{margin:1.3rem 0 .65rem;padding:.55rem 0;border-top:3px solid var(--red);border-bottom:1px solid #333;color:#fff;font-size:.72rem;font-weight:950;letter-spacing:.14em;text-transform:uppercase}.math-panel{display:grid;grid-template-columns:repeat(4,1fr);margin:.7rem 0 0;border:1px solid #333}.math-panel div{padding:.85rem 1rem;border-right:1px solid #333}.math-panel div:last-child{border-right:0}.math-panel span{display:block;color:#888;font-size:.56rem;font-weight:900;letter-spacing:.13em}.math-panel b{display:block;margin-top:.2rem;font-size:1.45rem;color:#fff}.equation{padding:1rem;border:1px solid #333;border-top:0;background:#101010;color:#b5b5b5;font:600 .82rem/1.7 "Courier New",monospace}.equation strong{color:#fff}
-  .event-index{display:grid;grid-template-columns:2fr .7fr .7fr .9fr .9fr;border-top:1px solid #333;border-left:5px solid var(--red);background:#0f0f0f}.event-index>div{padding:.9rem 1rem;border-right:1px solid #333}.event-index span{display:block;color:#777;font-size:.55rem;font-weight:900;letter-spacing:.13em}.event-index b{display:block;color:#fff;margin-top:.2rem}.stExpander{border:1px solid #333!important;border-radius:0!important;background:#0d0d0d}section[data-testid="stSidebar"]{background:#0b0b0b;border-right:1px solid #333}section[data-testid="stSidebar"] *{color:#eee}.fineprint{margin-top:2.5rem;padding-top:.7rem;border-top:1px solid #333;color:#666;font-size:.55rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+  .event-index{display:grid;grid-template-columns:2fr .7fr .7fr .9fr .9fr;border-top:1px solid #333;border-left:5px solid var(--red);background:#0f0f0f}.event-index>div{padding:.9rem 1rem;border-right:1px solid #333}.event-index span{display:block;color:#777;font-size:.55rem;font-weight:900;letter-spacing:.13em}.event-index b{display:block;color:#fff;margin-top:.2rem}.live-status{display:flex;align-items:center;gap:.55rem;margin:.55rem 0 1rem;color:#9a9a9a;font-size:.58rem;font-weight:900;letter-spacing:.13em;text-transform:uppercase}.live-status i{display:inline-block;width:8px;height:8px;border-radius:50%;background:#35b86b;box-shadow:0 0 0 4px rgba(53,184,107,.12)}.history-intro{display:flex;justify-content:space-between;align-items:end;margin:1.2rem 0 .8rem;padding-bottom:.65rem;border-bottom:3px solid var(--red)}.history-intro b{color:#fff;font-size:.9rem;letter-spacing:.1em}.history-intro span{color:#777;font-size:.58rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase}.stExpander{border:1px solid #333!important;border-radius:0!important;background:#0d0d0d}section[data-testid="stSidebar"]{background:#0b0b0b;border-right:1px solid #333}section[data-testid="stSidebar"] *{color:#eee}.fineprint{margin-top:2.5rem;padding-top:.7rem;border-top:1px solid #333;color:#666;font-size:.55rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
   @media(max-width:900px){.block-container{padding:0 1rem 3rem}.mast,.tape{margin-left:-1rem;margin-right:-1rem;padding-left:1rem;padding-right:1rem}.kpi-strip{grid-template-columns:repeat(2,1fr)}.event-head{align-items:flex-start}.math-panel{grid-template-columns:repeat(2,1fr)}}
 </style>
 """, unsafe_allow_html=True)
@@ -272,7 +422,7 @@ events = event_groups(log)
 performance = realized_metrics(log)
 
 st.markdown("<header class='mast'><div class='wordmark'><i>UFC</i> EDGE LEDGER</div>" f"<div class='descriptor'>{escape(bundle['version'])} / GRADIENT BOOSTING</div></header>", unsafe_allow_html=True)
-st.markdown(f"<div class='tape'><i></i><b>TRACK RECORD LIVE</b> &nbsp; / &nbsp; {performance['graded']} SETTLED BETS &nbsp; / &nbsp; {money(performance['total_pnl'], signed=True)} NET P&amp;L &nbsp; / &nbsp; {bundle['metrics']['holdout_fights']:,} UNSEEN HOLDOUT FIGHTS</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='tape'><i></i><b>MODEL TRACK RECORD</b> &nbsp; / &nbsp; {performance['graded']} SETTLED BETS &nbsp; / &nbsp; {money(performance['total_pnl'], signed=True)} NET P&amp;L &nbsp; / &nbsp; {bundle['metrics']['holdout_fights']:,} UNSEEN HOLDOUT FIGHTS</div>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### MODEL CONTROLS")
@@ -292,15 +442,18 @@ view = st.radio("Navigation", ["EVENT", "POSITIONS + P&L", "HISTORY"], horizonta
 
 if view == "EVENT":
     active_options = active_event_options()
-    history_labels = [f"SETTLED  /  {row['event']}  /  {row['date'].strftime('%b %-d') if pd.notna(row['date']) else '—'}" for row in events]
-    active_labels = [item["label"] for item in active_options]
-    choices = history_labels + active_labels
-    if not choices:
+    menu = event_menu(events, active_options)
+    if not menu:
         st.info("No tracked or upcoming UFC cards are available.")
     else:
-        selected_label = st.selectbox("Event", choices, index=0)
-        if selected_label in history_labels:
-            selected_event = events[history_labels.index(selected_label)]
+        menu_by_id = {item["id"]: item for item in menu}
+        selected_id = st.selectbox(
+            "Event", list(menu_by_id), index=0,
+            format_func=lambda item_id: menu_by_id[item_id]["label"],
+        )
+        selected = menu_by_id[selected_id]
+        if selected["kind"] == "recorded":
+            selected_event = selected["event"]
             event_header(selected_event)
             kpi_strip([
                 ("Net P&L", money(selected_event["pnl"], signed=True), f"{pct(selected_event['roi'])} return on capital", "positive" if selected_event["pnl"] >= 0 else "negative"),
@@ -312,37 +465,25 @@ if view == "EVENT":
             bets_table(selected_event["frame"])
             bets = selected_event["frame"][selected_event["frame"]["action"] == "BET"]
             if len(bets):
-                selected_pick = st.selectbox("Open a position", list(bets.index), format_func=lambda idx: f"{bets.loc[idx, 'pick']} / {bets.loc[idx, 'fighter_a']} vs {bets.loc[idx, 'fighter_b']}")
+                selected_pick = st.selectbox("Review a position", list(bets.index), format_func=lambda idx: f"{bets.loc[idx, 'pick']} / {bets.loc[idx, 'fighter_a']} vs {bets.loc[idx, 'fighter_b']}")
                 math_detail(bets.loc[selected_pick].to_dict(), bundle, fighters)
             event_analyses = analyses_from_log(selected_event["frame"], bundle, fighters)
             excel_bytes = build_excel(event_analyses, bundle, log, bankroll, selected_event["event"], cost_buffer=cost_buffer, min_edge=min_edge, min_prior_fights=int(min_fights), max_card_exposure=max_card_exposure, fighters=fighters)
             st.download_button("Download full Excel audit", excel_bytes, file_name="UFC_Edge_Model_Audit.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
-            option = active_options[active_labels.index(selected_label)]
-            live_name = selected_label.split("•")[1].strip() if "•" in selected_label else selected_label
-            event_header({"event": live_name, "date": pd.NaT, "status": "LIVE MARKET", "wins": 0, "losses": 0})
-            left, right = st.columns([4, 1], vertical_alignment="bottom")
-            with left:
-                custom_fight = st.text_input("Or price one fight", placeholder="Fighter A vs Fighter B")
-            with right:
-                run = st.button("Refresh prices", width="stretch")
-            if run:
-                try:
-                    started = time.perf_counter()
-                    search = custom_fight.strip() or option["value"]
-                    card = discover_card(search)
-                    rows = market_rows(pd.DataFrame(card).to_json(), manual_odds)
-                    current = analyze_card(card, rows, bundle, fighters, bankroll=bankroll, research_texts=uploaded_texts(research_files), min_edge=min_edge, cost_buffer=cost_buffer, min_prior_fights=int(min_fights), max_card_exposure=max_card_exposure, polymarket_only=not bool(manual_odds.strip()))
-                    update_prediction_log(STATE_DIR, current)
-                    update_market_history(STATE_DIR, current)
-                    st.session_state["current_analyses"] = current
-                    st.session_state["elapsed"] = time.perf_counter() - started
-                except Exception as exc:
-                    st.error(str(exc))
-            current = st.session_state.get("current_analyses", [])
-            if current:
-                live = pd.DataFrame([{"Fight": f"{row['fighter_a']} vs {row['fighter_b']}", "Trade": row["trade_side"], "Model fair": row["model_probability"], "Live ask": row["live_ask"], "Net edge": row["net_edge"], "Decision": row["action"], "Capital": row["position_dollars"], "Why": row["why"]} for row in current])
-                st.dataframe(live, width="stretch", hide_index=True, column_config={"Model fair": st.column_config.NumberColumn(format="percent"), "Live ask": st.column_config.NumberColumn(format="percent"), "Net edge": st.column_config.NumberColumn(format="percent"), "Capital": st.column_config.NumberColumn(format="dollar")})
+            option = selected["option"]
+            bouts = option.get("bouts") or []
+            live_name = bouts[0].get("event") if bouts else option["label"].split("•")[1].strip()
+            live_date = pd.to_datetime(bouts[0].get("event_date"), errors="coerce") if bouts else pd.NaT
+            event_header({
+                "event": live_name, "date": live_date,
+                "status": option.get("status", "LIVE MARKET"), "wins": 0, "losses": 0,
+                "record_value": len(bouts), "record_label": "FIGHTS ON CARD",
+            })
+            live_event_board(
+                option, bankroll, min_edge, cost_buffer, int(min_fights),
+                max_card_exposure, manual_odds, uploaded_texts(research_files),
+            )
 
 elif view == "POSITIONS + P&L":
     st.markdown("<section class='event-head'><div><span>MODEL TRACK RECORD</span><h1>POSITIONS + TOTAL P&L</h1></div>" f"<div class='event-record'><b>{performance['wins']}-{performance['losses']}</b><span>SETTLED RECORD</span></div></section>", unsafe_allow_html=True)
@@ -361,19 +502,33 @@ elif view == "POSITIONS + P&L":
     st.download_button("Download ledger CSV", log.to_csv(index=False).encode("utf-8"), file_name="UFC_Model_Ledger.csv", mime="text/csv")
 
 else:
-    st.markdown("<section class='event-head'><div><span>EVENT ARCHIVE</span><h1>HISTORICAL BETS</h1></div>" f"<div class='event-record'><b>{len(events)}</b><span>TRACKED EVENTS</span></div></section>", unsafe_allow_html=True)
-    for event in events:
-        date_label = event["date"].strftime("%b %-d, %Y") if pd.notna(event["date"]) else "—"
-        st.markdown(f"<div class='event-index'><div><span>{event['status']} / {date_label}</span><b>{escape(event['event'])}</b></div><div><span>RECORD</span><b>{event['wins']}-{event['losses']}</b></div><div><span>WIN RATE</span><b>{pct(event['win_rate'])}</b></div><div><span>CAPITAL</span><b>{money(event['stake'])}</b></div><div><span>NET P&L</span><b>{money(event['pnl'], signed=True)}</b></div></div>", unsafe_allow_html=True)
-        with st.expander(f"Open {event['event']}"):
-            bets_table(event["frame"])
-            all_decisions = event["frame"].copy()
-            all_decisions["Fight"] = all_decisions["fighter_a"] + " vs " + all_decisions["fighter_b"]
-            all_decisions["Decision"] = all_decisions["action"]
-            all_decisions["Model fair"] = all_decisions["model_probability"]
-            all_decisions["Market"] = all_decisions["market_probability"]
-            all_decisions["Reason"] = all_decisions["decision_reason"]
-            st.markdown("#### Every screened fight")
-            st.dataframe(all_decisions[["Fight", "pick", "Model fair", "Market", "Decision", "winner", "Reason"]], width="stretch", hide_index=True, column_config={"Model fair": st.column_config.NumberColumn(format="percent"), "Market": st.column_config.NumberColumn(format="percent")})
+    settled_events = [event for event in events if event["status"] == "SETTLED" and event["bets"] > 0]
+    st.markdown("<section class='event-head'><div><span>VERIFIED EVENT ARCHIVE</span><h1>BET HISTORY</h1></div>" f"<div class='event-record'><b>{len(settled_events)}</b><span>SETTLED EVENTS</span></div></section>", unsafe_allow_html=True)
+    kpi_strip([
+        ("Net P&L", money(performance["pnl"], signed=True), f"{pct(performance['roi'])} realized return", "positive" if performance["pnl"] >= 0 else "negative"),
+        ("Win rate", pct(performance["win_rate"]), f"{performance['wins']} wins / {performance['losses']} losses", ""),
+        ("Settled bets", f"{performance['graded']}", "recorded before each fight", ""),
+        ("Capital used", money(performance["staked"]), "across settled positions", ""),
+    ])
+    if not settled_events:
+        st.info("No settled events have been recorded yet.")
+    else:
+        history_ids = list(range(len(settled_events)))
+        selected_history_id = st.selectbox(
+            "Historical event", history_ids,
+            format_func=lambda idx: f"{settled_events[idx]['event']}  /  {settled_events[idx]['date'].strftime('%b %-d, %Y') if pd.notna(settled_events[idx]['date']) else 'Date unavailable'}",
+        )
+        event = settled_events[selected_history_id]
+        date_label = event["date"].strftime("%b %-d, %Y") if pd.notna(event["date"]) else "Date unavailable"
+        st.markdown(f"<div class='event-index'><div><span>SETTLED / {date_label}</span><b>{escape(event['event'])}</b></div><div><span>RECORD</span><b>{event['wins']}-{event['losses']}</b></div><div><span>WIN RATE</span><b>{pct(event['win_rate'])}</b></div><div><span>CAPITAL</span><b>{money(event['stake'])}</b></div><div><span>NET P&L</span><b>{money(event['pnl'], signed=True)}</b></div></div>", unsafe_allow_html=True)
+        st.markdown("<div class='history-intro'><b>RECORDED POSITIONS</b><span>Original entry price · stake · result · reason</span></div>", unsafe_allow_html=True)
+        bets_table(event["frame"])
+        bets = event["frame"][event["frame"]["action"] == "BET"]
+        if len(bets):
+            selected_pick = st.selectbox(
+                "Review the math behind a position", list(bets.index),
+                format_func=lambda idx: f"{bets.loc[idx, 'pick']} / {bets.loc[idx, 'fighter_a']} vs {bets.loc[idx, 'fighter_b']}",
+            )
+            math_detail(bets.loc[selected_pick].to_dict(), bundle, fighters)
 
 st.markdown(f"<div class='fineprint'>{bundle['metrics']['training_fights']:,} TRAINING FIGHTS / {bundle['metrics']['holdout_fights']:,} UNSEEN HOLDOUT / {len(fighters):,} FIGHTER SNAPSHOTS / PAPER MODEL — NOT AN EXECUTION SERVICE</div>", unsafe_allow_html=True)

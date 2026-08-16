@@ -197,6 +197,12 @@ def http_json(url, params=None):
     return response.json()
 
 
+def http_post_json(url, payload):
+    response = HTTP.post(url, json=payload, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
 def http_soup(url):
     response = HTTP.get(url, timeout=7)
     if response.status_code >= 400 and url.startswith("http://"):
@@ -323,10 +329,15 @@ def discover_event_options():
     try:
         cards = _active_polymarket_ufc_cards()
         if cards:
-            return [{"label": card["label"], "value": card["value"]} for card in cards]
+            return cards
     except Exception:
         pass
-    return [{"label": "UFC 330  •  Aug 15  •  12 fights", "value": "UFC 330"}]
+    return [{
+        "label": "SETTLED  •  UFC 330  •  Aug 15  •  12 fights",
+        "value": "UFC 330", "status": "SETTLED",
+        "start_utc": datetime(2026, 8, 15, tzinfo=timezone.utc),
+        "bouts": [],
+    }]
 
 
 def discover_card(event_search: str, refresh_results: bool = False):
@@ -411,6 +422,47 @@ def polymarket_book(token_id):
     }
 
 
+def polymarket_books(token_ids):
+    """Fetch one consistent public CLOB snapshot for every requested contract."""
+    token_ids = [str(token_id) for token_id in dict.fromkeys(token_ids) if str(token_id)]
+    if not token_ids:
+        return {}
+    try:
+        payload = [{"token_id": token_id} for token_id in token_ids]
+        books = http_post_json("https://clob.polymarket.com/books", payload)
+        parsed = {}
+        for data in books if isinstance(books, list) else []:
+            token_id = str(data.get("asset_id") or "")
+            bids = [(safe_float(row.get("price")), safe_float(row.get("size"), 0)) for row in data.get("bids", [])]
+            asks = [(safe_float(row.get("price")), safe_float(row.get("size"), 0)) for row in data.get("asks", [])]
+            bids = [row for row in bids if 0 < row[0] < 1]
+            asks = [row for row in asks if 0 < row[0] < 1]
+            best_bid = max(bids, key=lambda row: row[0]) if bids else (np.nan, 0)
+            best_ask = min(asks, key=lambda row: row[0]) if asks else (np.nan, 0)
+            if token_id:
+                parsed[token_id] = {
+                    "bid": best_bid[0], "bid_size": best_bid[1],
+                    "ask": best_ask[0], "ask_size": best_ask[1],
+                    "timestamp": str(data.get("timestamp") or ""),
+                }
+        if parsed:
+            return parsed
+    except Exception:
+        pass
+
+    # A per-contract fallback keeps the live board available if the batch
+    # endpoint is temporarily unavailable.
+    parsed = {}
+    with ThreadPoolExecutor(max_workers=min(12, max(1, len(token_ids)))) as executor:
+        futures = {executor.submit(polymarket_book, token_id): token_id for token_id in token_ids}
+        for future in as_completed(futures):
+            try:
+                parsed[futures[future]] = future.result()
+            except Exception:
+                pass
+    return parsed
+
+
 def fighter_named_in_text(bout, text):
     target = canonical_name(text)
     choices = []
@@ -464,14 +516,7 @@ def fetch_polymarket_prices(card):
                 "url": f"https://polymarket.com/event/{event.get('slug', '')}",
             })
     unique_tokens = sorted({token for item in specifications for token in item["tokens"].values()})
-    books = {}
-    with ThreadPoolExecutor(max_workers=min(12, max(1, len(unique_tokens)))) as executor:
-        futures = {executor.submit(polymarket_book, token): token for token in unique_tokens}
-        for future in as_completed(futures):
-            try:
-                books[futures[future]] = future.result()
-            except Exception:
-                pass
+    books = polymarket_books(unique_tokens)
     for item in specifications:
         bout = item["bout"]
         token_a = item["tokens"].get(bout["fighter_a"])
@@ -666,7 +711,7 @@ def analyze_card(card, market_rows, bundle, fighters, bankroll=10_000, research_
         if market is None:
             why = "No live Polymarket order book" if polymarket_only else "No current executable price"
         elif experience < min_prior_fights:
-            why = f"Only {experience} prior UFC fights on the less-experienced side"
+            why = f"Only {experience} prior UFC fights for the lower-experience fighter"
         else:
             prefix = "Underdog value trade. " if probability < 0.5 else ""
             why = prefix + "; ".join(f"{row['factor']} {row['impact_pick']:+.1%}" for row in top[:2])
@@ -754,6 +799,79 @@ def normalize_prediction_log(log):
         calculated.loc[valid] = stakes.loc[valid] * (1 / prices.loc[valid] - 1)
         log.loc[missing_profit, "potential_profit"] = calculated
     return log[LOG_COLUMNS]
+
+
+def _event_identity(record):
+    """Return a stable event key and a clean display name for legacy ledger rows."""
+    raw = re.sub(r"\s+", " ", str(record.get("event") or "")).strip()
+    normalized = canonical_name(raw)
+    event_date = pd.to_datetime(record.get("event_date"), errors="coerce")
+    date_key = event_date.strftime("%Y-%m-%d") if pd.notna(event_date) else "undated"
+
+    numbered = re.search(r"\bufc\s+(\d+)\b", normalized)
+    if numbered:
+        number = numbered.group(1)
+        if number == "330":
+            label = "UFC 330: Makhachev vs. Machado Garry"
+        else:
+            label = raw if raw.lower().startswith(f"ufc {number}:") else f"UFC {number}"
+        return f"ufc-{number}|{date_key}", label
+
+    if normalized.startswith("ufc fight night"):
+        label = raw if ":" in raw else "UFC Fight Night"
+        return f"ufc-fight-night|{date_key}", label
+
+    fighter_a = re.sub(r"\s+", " ", str(record.get("fighter_a") or "")).strip()
+    fighter_b = re.sub(r"\s+", " ", str(record.get("fighter_b") or "")).strip()
+    if fighter_a and fighter_b and " vs " in f" {normalized} ":
+        return f"custom|{date_key}|{'|'.join(pair_key(fighter_a, fighter_b))}", f"{fighter_a} vs {fighter_b}"
+    return "", ""
+
+
+def repair_prediction_log(log):
+    """Remove malformed legacy rows and merge aliases for the same event and bout."""
+    work = normalize_prediction_log(log)
+    if work.empty:
+        return work
+
+    identities = [_event_identity(row) for row in work.to_dict("records")]
+    work["_event_key"] = [item[0] for item in identities]
+    work["_event_label"] = [item[1] for item in identities]
+    work["_bout_key"] = ["|".join(pair_key(a, b)) for a, b in zip(work["fighter_a"], work["fighter_b"])]
+    valid = (
+        work["_event_key"].ne("")
+        & work["fighter_a"].astype(str).str.strip().ne("")
+        & work["fighter_b"].astype(str).str.strip().ne("")
+        & work["_bout_key"].str.replace("|", "", regex=False).ne("")
+    )
+    work = work.loc[valid].copy()
+    if work.empty:
+        return normalize_prediction_log(work)
+
+    selected = []
+    for (_, _), group in work.groupby(["_event_key", "_bout_key"], sort=False, dropna=False):
+        labels = [value for value in group["_event_label"].astype(str) if value]
+        display_name = max(labels, key=len) if labels else str(group.iloc[0]["event"])
+        ranked = group.copy()
+        ranked["_quality"] = (
+            ranked["entry_source"].astype(str).str.contains("recovered pre-fight snapshot", case=False, regex=False).astype(int) * 1000
+            + ranked["status"].eq("COMPLETED").astype(int) * 200
+            + ranked["action"].eq("BET").astype(int) * 40
+            + ranked["entry_price"].notna().astype(int) * 10
+            + ranked["decision_reason"].astype(str).str.strip().ne("").astype(int) * 5
+        )
+        ranked["_time"] = pd.to_datetime(ranked["timestamp_utc"], utc=True, errors="coerce")
+        row = ranked.sort_values(["_quality", "_time"], na_position="first").iloc[-1].copy()
+        row["event"] = display_name
+        parsed_date = pd.to_datetime(row.get("event_date"), errors="coerce")
+        row["event_date"] = parsed_date.strftime("%Y-%m-%d") if pd.notna(parsed_date) else ""
+        row["prediction_id"] = f"{canonical_name(display_name)}|{row['_bout_key']}"
+        selected.append(row)
+
+    repaired = pd.DataFrame(selected).drop(columns=[
+        "_event_key", "_event_label", "_bout_key", "_quality", "_time",
+    ], errors="ignore")
+    return normalize_prediction_log(repaired).reset_index(drop=True)
 
 
 def load_prediction_log(state_dir: Path):

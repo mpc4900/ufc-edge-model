@@ -1,6 +1,8 @@
-# UFC Edge Model
+# UFC Edge Ledger
 
-A fast Streamlit version of the calibrated UFC gradient-boosting model. The model is pre-trained and cached, so each refresh only retrieves the fight card and current public prices.
+A clean Streamlit ledger for a calibrated UFC gradient-boosting model. It keeps one canonical record per event, separates open positions from settled history, and compares the model's probability with the executable Polymarket ask.
+
+Active cards use Polymarket's public Gamma and CLOB APIs. The order book refreshes automatically every 30 seconds and can also be refreshed manually. Historical entry prices remain locked so later market moves never rewrite the original paper trade.
 
 ## Deploy on Streamlit Community Cloud
 
