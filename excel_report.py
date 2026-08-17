@@ -36,16 +36,21 @@ def formats(workbook):
         "small_wrap": workbook.add_format({**base, "font_size": 9, "font_color": "#45484E", "bottom": 1, "bottom_color": BORDER, "valign": "top", "text_wrap": True}),
         "pct": workbook.add_format({**base, "bottom": 1, "bottom_color": BORDER, "num_format": "0.0%;[Red](0.0%);-", "align": "right", "valign": "vcenter"}),
         "pct_input": workbook.add_format({**base, "font_color": INPUT_BLUE, "bottom": 1, "bottom_color": BORDER, "num_format": "0.0%;[Red](0.0%);-", "align": "right"}),
-        "pct_formula": workbook.add_format({**base, "font_color": FORMULA_GREEN, "bottom": 1, "bottom_color": BORDER, "num_format": "0.0%;[Red](0.0%);-", "align": "right"}),
+        "pct_formula": workbook.add_format({**base, "font_color": BLACK, "bottom": 1, "bottom_color": BORDER, "num_format": "0.0%;[Red](0.0%);-", "align": "right"}),
+        "pct_link": workbook.add_format({**base, "font_color": FORMULA_GREEN, "bottom": 1, "bottom_color": BORDER, "num_format": "0.0%;[Red](0.0%);-", "align": "right"}),
         "money": workbook.add_format({**base, "bottom": 1, "bottom_color": BORDER, "num_format": "$#,##0;[Red]($#,##0);-", "align": "right", "valign": "vcenter"}),
-        "money_formula": workbook.add_format({**base, "font_color": FORMULA_GREEN, "bottom": 1, "bottom_color": BORDER, "num_format": "$#,##0;[Red]($#,##0);-", "align": "right"}),
+        "money_formula": workbook.add_format({**base, "font_color": BLACK, "bottom": 1, "bottom_color": BORDER, "num_format": "$#,##0;[Red]($#,##0);-", "align": "right"}),
+        "money_link": workbook.add_format({**base, "font_color": FORMULA_GREEN, "bottom": 1, "bottom_color": BORDER, "num_format": "$#,##0;[Red]($#,##0);-", "align": "right"}),
         "num": workbook.add_format({**base, "bottom": 1, "bottom_color": BORDER, "num_format": "0.000", "align": "right", "valign": "vcenter"}),
         "num_input": workbook.add_format({**base, "font_color": INPUT_BLUE, "bottom": 1, "bottom_color": BORDER, "num_format": "0.000", "align": "right"}),
         "int": workbook.add_format({**base, "bottom": 1, "bottom_color": BORDER, "num_format": "#,##0", "align": "right", "valign": "vcenter"}),
         "int_input": workbook.add_format({**base, "font_color": INPUT_BLUE, "bottom": 1, "bottom_color": BORDER, "num_format": "#,##0", "align": "right"}),
         "date": workbook.add_format({**base, "bottom": 1, "bottom_color": BORDER, "num_format": "mmm d, yyyy", "align": "center", "valign": "vcenter"}),
         "datetime": workbook.add_format({**base, "bottom": 1, "bottom_color": BORDER, "num_format": "mmm d, yyyy h:mm AM/PM", "align": "center", "valign": "vcenter"}),
-        "formula_text": workbook.add_format({**base, "font_color": FORMULA_GREEN, "bottom": 1, "bottom_color": BORDER, "valign": "vcenter"}),
+        "formula_text": workbook.add_format({**base, "font_color": BLACK, "bottom": 1, "bottom_color": BORDER, "valign": "vcenter"}),
+        "link_text": workbook.add_format({**base, "font_color": FORMULA_GREEN, "bottom": 1, "bottom_color": BORDER, "valign": "vcenter"}),
+        "odds": workbook.add_format({**base, "bottom": 1, "bottom_color": BORDER, "num_format": "+0;[Red]-0;-", "align": "right", "valign": "vcenter"}),
+        "odds_formula": workbook.add_format({**base, "font_color": BLACK, "bottom": 1, "bottom_color": BORDER, "num_format": "+0;[Red]-0;-", "align": "right"}),
         "bet": workbook.add_format({**base, "bold": True, "font_color": WHITE, "bg_color": RED, "align": "center", "valign": "vcenter"}),
         "no_bet": workbook.add_format({**base, "bold": True, "font_color": "#BFC1C5", "bg_color": MID, "align": "center", "valign": "vcenter"}),
         "pass": workbook.add_format({**base, "bold": True, "font_color": WHITE, "bg_color": GREEN, "align": "center", "valign": "vcenter"}),
@@ -78,7 +83,7 @@ def _write_value(worksheet, row, column, value, kind, fmt):
             worksheet.write_datetime(row, column, date.to_pydatetime(), fmt[kind])
         else:
             worksheet.write_blank(row, column, None, fmt[kind])
-    elif kind in {"pct", "money", "num", "int"}:
+    elif kind in {"pct", "money", "num", "int", "odds"}:
         number = safe_float(value)
         if np.isfinite(number):
             worksheet.write_number(row, column, number, fmt[kind])
@@ -86,6 +91,12 @@ def _write_value(worksheet, row, column, value, kind, fmt):
             worksheet.write_blank(row, column, None, fmt[kind])
     else:
         worksheet.write(row, column, "" if pd.isna(value) else str(value), fmt.get(kind, fmt["text"]))
+
+
+def _finite_cache(value, fallback=""):
+    """Return a safe cached formula result for Excel and preview renderers."""
+    number = safe_float(value)
+    return number if np.isfinite(number) else fallback
 
 
 def _table_sheet(workbook, fmt, name, title, subtitle, columns, rows):
@@ -135,6 +146,9 @@ def build_excel(
     min_prior_fights=3,
     convergence=0.50,
     max_card_exposure=0.10,
+    kelly_fraction=0.25,
+    max_position_pct=0.05,
+    reliability_fights=8,
     capture_target=0.65,
     minimum_exit_return=0.03,
     stop_loss=0.15,
@@ -172,9 +186,10 @@ def build_excel(
         ("Cost buffer", cost_buffer, "pct", "Model P − live ask − cost buffer", "Allowance for spread, fees and slippage"),
         ("Minimum net edge", min_edge, "pct", "Minimum edge required for BET", "Below this level the decision is NO BET"),
         ("Minimum prior UFC fights", min_prior_fights, "int", "Minimum of both fighters' UFC experience", "Reduces action on thin UFC samples"),
+        ("Reliability anchor", reliability_fights, "int", "MIN(100%, prior fights ÷ anchor)", "Scales capital until the lower-experience fighter reaches this sample"),
         ("Convergence scenario", convergence, "pct", "Ask + convergence × (fair − ask)", "Illustrative exit target; not guaranteed"),
-        ("Kelly fraction", 0.25, "pct", "Quarter Kelly", "Reduces full-Kelly volatility"),
-        ("Per-fight position cap", 0.02, "pct", "Maximum share of bankroll in one fight", "Concentration control"),
+        ("Kelly fraction", kelly_fraction, "pct", "Fractional Kelly multiplier", "Reduces full-Kelly volatility and model-error sensitivity"),
+        ("Per-fight position cap", max_position_pct, "pct", "Maximum share of bankroll in one fight", "1/20 of bankroll concentration limit"),
         ("Card exposure cap", max_card_exposure, "pct", "Maximum total risk on one card", "Portfolio-level exposure control"),
         ("Gap capture target", capture_target, "pct", "Share of entry-to-fair gap required before SELL", "Measures observed convergence"),
         ("Minimum exit return", minimum_exit_return, "pct", "Required sellable return before SELL", "Prevents tiny, untradeable exit signals"),
@@ -188,18 +203,21 @@ def build_excel(
         assumptions.write(row, 3, use, fmt["wrap"])
         assumptions.write(row, 4, interpretation, fmt["small_wrap"])
         assumptions.set_row(row, 34)
-    assumptions.merge_range("A18:E19", "COLOR KEY: blue font = hardcoded input or live snapshot. Green font = Excel formula. Red blocks = BET/action emphasis. Market prices are executable order-book snapshots and can change after download.", fmt["note"])
+    assumptions.merge_range("A19:E20", "COLOR KEY: blue font = editable assumption or live snapshot. Green font = link to another workbook tab. Black font = calculation. Red blocks = BET/action emphasis. Market prices are executable order-book snapshots and can change after download.", fmt["note"])
 
     # Formula-driven pricing table.
     pricing = workbook.add_worksheet("FIGHT PRICING")
-    _write_title(pricing, "UFC EDGE — FIGHT PRICING", f"{event_search} // live snapshot {now_label}", 17, fmt)
+    _write_title(pricing, "UFC EDGE — FIGHT PRICING", f"{event_search} // live snapshot {now_label}", 28, fmt)
     pricing.freeze_panes(4, 3)
     pricing_headers = [
-        "Fight", "Likely Winner", "Trade Side", "Model Fair P", "Live Bid", "Live Ask",
-        "Cost Buffer", "Net Edge", "Prior UFC Fights", "Full Kelly", "Quarter Kelly",
-        "Position $", "Exit Target", "Decision", "Decision Rationale", "Market Source", "Market URL", "As Of UTC",
+        "Fight", "Likely Winner", "Trade Side", "Model Fair P", "Model Odds", "Live Bid",
+        "Entry Ask", "Entry Odds", "Cost Buffer", "Effective Entry", "Gross Value Gap",
+        "Net Edge", "Maximum Buy", "Prior UFC Fights", "Data Reliability", "Full Kelly",
+        "Fractional Kelly", "Uncapped Risk %", "Per-Fight Cap", "Portfolio Scale",
+        "Final Risk %", "Position $", "Expected P&L", "Entry Timing", "Decision",
+        "Decision Rationale", "Market Source", "Market URL", "As Of UTC",
     ]
-    widths = [36, 23, 23, 13, 11, 11, 11, 12, 14, 12, 12, 13, 12, 12, 44, 19, 48, 22]
+    widths = [36, 23, 23, 13, 12, 11, 11, 12, 11, 13, 14, 12, 13, 14, 14, 12, 14, 15, 13, 14, 12, 13, 14, 16, 12, 46, 20, 30, 23]
     for col, label in enumerate(pricing_headers):
         pricing.write(3, col, label, fmt["header"])
         pricing.set_column(col, col, widths[col])
@@ -210,36 +228,59 @@ def build_excel(
         pricing.write(row_index, 1, record["likely_winner"], fmt["text"])
         pricing.write(row_index, 2, record["trade_side"], fmt["text"])
         pricing.write_number(row_index, 3, safe_float(record["model_probability"]), fmt["pct_input"])
-        _write_value(pricing, row_index, 4, record.get("live_bid"), "pct", fmt)
-        _write_value(pricing, row_index, 5, record.get("live_ask"), "pct", fmt)
-        pricing.write_formula(row_index, 6, "=ASSUMPTIONS!$B$6", fmt["pct_formula"], cost_buffer)
+        model_odds = safe_float(record.get("model_odds"))
+        pricing.write_formula(row_index, 4, f'=IF(D{excel_row}>=0.5,-100*D{excel_row}/(1-D{excel_row}),100*(1-D{excel_row})/D{excel_row})', fmt["odds_formula"], model_odds if np.isfinite(model_odds) else "")
+        _write_value(pricing, row_index, 5, record.get("live_bid"), "pct", fmt)
+        _write_value(pricing, row_index, 6, record.get("live_ask"), "pct", fmt)
+        entry_odds = safe_float(record.get("entry_odds", record.get("american_odds")))
+        pricing.write_formula(row_index, 7, f'=IF(ISNUMBER(G{excel_row}),IF(G{excel_row}>=0.5,-100*G{excel_row}/(1-G{excel_row}),100*(1-G{excel_row})/G{excel_row}),"")', fmt["odds_formula"], entry_odds if np.isfinite(entry_odds) else "")
+        pricing.write_formula(row_index, 8, "='ASSUMPTIONS'!$B$6", fmt["pct_link"], cost_buffer)
+        effective_entry = safe_float(record.get("effective_entry"))
+        pricing.write_formula(row_index, 9, f'=IF(ISNUMBER(G{excel_row}),MIN(0.999,G{excel_row}+I{excel_row}),"")', fmt["pct_formula"], effective_entry if np.isfinite(effective_entry) else "")
+        gross_edge = safe_float(record.get("gross_edge"))
+        pricing.write_formula(row_index, 10, f'=IF(ISNUMBER(G{excel_row}),D{excel_row}-G{excel_row},"")', fmt["pct_formula"], gross_edge if np.isfinite(gross_edge) else "")
         edge = safe_float(record.get("net_edge"))
-        pricing.write_formula(row_index, 7, f'=IF(ISNUMBER(F{excel_row}),D{excel_row}-F{excel_row}-G{excel_row},"")', fmt["pct_formula"], edge if np.isfinite(edge) else "")
-        pricing.write_number(row_index, 8, int(record.get("experience", 0)), fmt["int_input"])
-        ask = safe_float(record.get("live_ask"))
-        full_kelly = max(0, edge / max(1e-9, 1 - ask - cost_buffer)) if np.isfinite(edge) and np.isfinite(ask) else np.nan
-        pricing.write_formula(row_index, 9, f'=IFERROR(MAX(0,H{excel_row}/(1-F{excel_row}-G{excel_row})),0)', fmt["pct_formula"], full_kelly if np.isfinite(full_kelly) else 0)
-        pricing.write_formula(row_index, 10, f"=J{excel_row}*ASSUMPTIONS!$B$10", fmt["pct_formula"], full_kelly * 0.25 if np.isfinite(full_kelly) else 0)
-        pricing.write_number(row_index, 11, safe_float(record.get("position_dollars"), 0), fmt["money"])
-        exit_target = safe_float(record.get("exit_target"))
-        pricing.write_formula(row_index, 12, f'=IFERROR(MIN(D{excel_row},F{excel_row}+ASSUMPTIONS!$B$9*(D{excel_row}-F{excel_row})),"")', fmt["pct_formula"], exit_target if np.isfinite(exit_target) else "")
-        decision_formula = f'=IF(AND(ISNUMBER(F{excel_row}),H{excel_row}>=ASSUMPTIONS!$B$7,I{excel_row}>=ASSUMPTIONS!$B$8),"BET","NO BET")'
-        pricing.write_formula(row_index, 13, decision_formula, fmt["bet"] if record["action"] == "BET" else fmt["no_bet"], record["action"])
-        pricing.write(row_index, 14, record.get("why", ""), fmt["wrap"])
-        pricing.write(row_index, 15, record.get("market_source", ""), fmt["text"])
+        pricing.write_formula(row_index, 11, f'=IF(ISNUMBER(J{excel_row}),D{excel_row}-J{excel_row},"")', fmt["pct_formula"], edge if np.isfinite(edge) else "")
+        max_entry = safe_float(record.get("max_entry_price"))
+        pricing.write_formula(row_index, 12, f'=D{excel_row}-\'ASSUMPTIONS\'!$B$6-\'ASSUMPTIONS\'!$B$7', fmt["pct_formula"], max_entry if np.isfinite(max_entry) else "")
+        experience = int(record.get("experience", 0))
+        pricing.write_number(row_index, 13, experience, fmt["int_input"])
+        reliability = safe_float(record.get("data_reliability"), min(1, experience / max(1, reliability_fights)))
+        pricing.write_formula(row_index, 14, f'=MIN(1,N{excel_row}/\'ASSUMPTIONS\'!$B$9)', fmt["pct_formula"], reliability)
+        full_kelly = safe_float(record.get("full_kelly"))
+        pricing.write_formula(row_index, 15, f'=IFERROR(MAX(0,L{excel_row}/(1-J{excel_row})),0)', fmt["pct_formula"], full_kelly if np.isfinite(full_kelly) else 0)
+        fractional_kelly = full_kelly * kelly_fraction if np.isfinite(full_kelly) else 0
+        pricing.write_formula(row_index, 16, f'=P{excel_row}*\'ASSUMPTIONS\'!$B$11', fmt["pct_formula"], fractional_kelly)
+        uncapped = safe_float(record.get("uncapped_position_fraction"), fractional_kelly * reliability)
+        pricing.write_formula(row_index, 17, f'=Q{excel_row}*O{excel_row}', fmt["pct_formula"], uncapped)
+        capped = min(max_position_pct, uncapped)
+        pricing.write_formula(row_index, 18, f'=MIN(R{excel_row},\'ASSUMPTIONS\'!$B$12)', fmt["pct_formula"], capped)
+        portfolio_scale = safe_float(record.get("portfolio_scale"), 1 if record.get("action") == "BET" else 0)
+        pricing.write_number(row_index, 19, portfolio_scale, fmt["pct_formula"])
+        final_risk = safe_float(record.get("position_fraction"), capped * portfolio_scale if record.get("action") == "BET" else 0)
+        pricing.write_formula(row_index, 20, f'=IF(Y{excel_row}="BET",S{excel_row}*T{excel_row},0)', fmt["pct_formula"], final_risk)
+        pricing.write_formula(row_index, 21, f'=\'ASSUMPTIONS\'!$B$5*U{excel_row}', fmt["money_formula"], safe_float(record.get("position_dollars"), 0))
+        expected_profit = safe_float(record.get("expected_profit"))
+        pricing.write_formula(row_index, 22, f'=IF(Y{excel_row}="BET",V{excel_row}*(D{excel_row}/J{excel_row}-1),0)', fmt["money_formula"], expected_profit if np.isfinite(expected_profit) else 0)
+        timing = str(record.get("timing_signal") or "")
+        pricing.write_formula(row_index, 23, f'=IF(N{excel_row}<\'ASSUMPTIONS\'!$B$8,"PASS - THIN DATA",IF(NOT(ISNUMBER(G{excel_row})),"WAIT FOR LIVE PRICE",IF(G{excel_row}<=M{excel_row},"ENTER NOW","WAIT")))', fmt["formula_text"], timing)
+        decision_formula = f'=IF(AND(ISNUMBER(G{excel_row}),L{excel_row}>=\'ASSUMPTIONS\'!$B$7,N{excel_row}>=\'ASSUMPTIONS\'!$B$8),"BET","NO BET")'
+        pricing.write_formula(row_index, 24, decision_formula, fmt["bet"] if record["action"] == "BET" else fmt["no_bet"], record["action"])
+        pricing.write(row_index, 25, record.get("timing_reason") or record.get("why", ""), fmt["wrap"])
+        pricing.write(row_index, 26, record.get("market_source", ""), fmt["text"])
         url = str(record.get("market_url") or "")
         if url.startswith("http"):
-            pricing.write_url(row_index, 16, url, string="Open market")
+            pricing.write_url(row_index, 27, url, string="Open market")
         else:
-            pricing.write(row_index, 16, "", fmt["text"])
-        pricing.write(row_index, 17, str(record.get("as_of_utc") or ""), fmt["small_wrap"])
+            pricing.write(row_index, 27, "", fmt["text"])
+        pricing.write(row_index, 28, str(record.get("as_of_utc") or ""), fmt["small_wrap"])
     if analyses:
-        pricing.autofilter(3, 0, 3 + len(analyses), 17)
-        pricing.conditional_format(4, 7, 3 + len(analyses), 7, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#D9EAD3"})
+        pricing.autofilter(3, 0, 3 + len(analyses), 28)
+        pricing.conditional_format(4, 11, 3 + len(analyses), 11, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#D9EAD3"})
 
     # Decision board links to the pricing sheet so the displayed math stays auditable.
     dashboard = workbook.add_worksheet("DECISION BOARD")
-    _write_title(dashboard, "UFC EDGE — DECISION BOARD", f"{event_search} // generated {now_label}", 7, fmt)
+    _write_title(dashboard, "UFC EDGE — DECISION BOARD", f"{event_search} // generated {now_label}", 11, fmt)
     dashboard.freeze_panes(8, 0)
     bet_count = int((prediction_log.get("action", pd.Series(dtype=str)) == "BET").sum()) if len(prediction_log) else 0
     edges = [safe_float(row.get("net_edge")) for row in analyses if np.isfinite(safe_float(row.get("net_edge")))]
@@ -249,16 +290,16 @@ def build_excel(
     model_input_columns = [column for column in fighters.columns if column not in {"Fighter", "Canonical"}]
     data_points = int(len(fighters) * len(model_input_columns))
     cards = [
-        ("A4:B4", "A5:B6", "NET MODEL P&L", dashboard_realized["total_pnl"], "card_money"),
-        ("C4:D4", "C5:D6", "SETTLED WIN RATE", dashboard_realized["win_rate"], "card_pct"),
-        ("E4:F4", "E5:F6", "RECORDED BETS", bet_count, "card_value"),
-        ("G4:H4", "G5:H6", "FIGHTER STAT CELLS", data_points, "card_value"),
+        ("A4:C4", "A5:C6", "NET MODEL P&L", dashboard_realized["total_pnl"], "card_money"),
+        ("D4:F4", "D5:F6", "SETTLED WIN RATE", dashboard_realized["win_rate"], "card_pct"),
+        ("G4:I4", "G5:I6", "RECORDED BETS", bet_count, "card_value"),
+        ("J4:L4", "J5:L6", "FIGHTER STAT CELLS", data_points, "card_value"),
     ]
     for label_range, value_range, label, value, kind in cards:
         dashboard.merge_range(label_range, label, fmt["card_label"])
         dashboard.merge_range(value_range, value if np.isfinite(safe_float(value)) else "—", fmt[kind] if np.isfinite(safe_float(value)) else fmt["card_value"])
-    headers = ["Fight", "Trade Side", "Model Fair", "Live Ask", "Net Edge", "BET / NO BET", "Position $", "Why"]
-    dashboard_widths = [38, 24, 13, 12, 12, 15, 14, 46]
+    headers = ["Fight", "Trade Side", "Model Fair", "Model Odds", "Entry Ask", "Entry Odds", "Net Edge", "When", "BET / NO BET", "Risk %", "Position $", "Why"]
+    dashboard_widths = [38, 24, 13, 12, 12, 12, 12, 16, 15, 11, 14, 46]
     for col, label in enumerate(headers):
         dashboard.write(7, col, label, fmt["header"])
         dashboard.set_column(col, col, dashboard_widths[col])
@@ -266,20 +307,24 @@ def build_excel(
         source_row = row_index - 3
         dashboard.set_row(row_index, 34)
         links = [
-            (0, f"='FIGHT PRICING'!A{source_row}", f"{record['fighter_a']} vs {record['fighter_b']}", fmt["formula_text"]),
-            (1, f"='FIGHT PRICING'!C{source_row}", record["trade_side"], fmt["formula_text"]),
-            (2, f"='FIGHT PRICING'!D{source_row}", record["model_probability"], fmt["pct_formula"]),
-            (3, f"='FIGHT PRICING'!F{source_row}", record.get("live_ask", ""), fmt["pct_formula"]),
-            (4, f"='FIGHT PRICING'!H{source_row}", record.get("net_edge", ""), fmt["pct_formula"]),
+            (0, f"='FIGHT PRICING'!A{source_row}", f"{record['fighter_a']} vs {record['fighter_b']}", fmt["link_text"]),
+            (1, f"='FIGHT PRICING'!C{source_row}", record["trade_side"], fmt["link_text"]),
+            (2, f"='FIGHT PRICING'!D{source_row}", _finite_cache(record.get("model_probability")), fmt["pct_link"]),
+            (3, f"='FIGHT PRICING'!E{source_row}", _finite_cache(record.get("model_odds")), fmt["odds_formula"]),
+            (4, f"='FIGHT PRICING'!G{source_row}", _finite_cache(record.get("live_ask")), fmt["pct_link"]),
+            (5, f"='FIGHT PRICING'!H{source_row}", _finite_cache(record.get("entry_odds", record.get("american_odds"))), fmt["odds_formula"]),
+            (6, f"='FIGHT PRICING'!L{source_row}", _finite_cache(record.get("net_edge")), fmt["pct_link"]),
+            (7, f"='FIGHT PRICING'!X{source_row}", record.get("timing_signal", ""), fmt["link_text"]),
         ]
         for col, formula, value, cell_fmt in links:
             dashboard.write_formula(row_index, col, formula, cell_fmt, value)
-        dashboard.write_formula(row_index, 5, f"='FIGHT PRICING'!N{source_row}", fmt["bet"] if record["action"] == "BET" else fmt["no_bet"], record["action"])
-        dashboard.write_formula(row_index, 6, f"='FIGHT PRICING'!L{source_row}", fmt["money_formula"], record.get("position_dollars", 0))
-        dashboard.write_formula(row_index, 7, f"='FIGHT PRICING'!O{source_row}", fmt["formula_text"], record.get("why", ""))
+        dashboard.write_formula(row_index, 8, f"='FIGHT PRICING'!Y{source_row}", fmt["bet"] if record["action"] == "BET" else fmt["no_bet"], record["action"])
+        dashboard.write_formula(row_index, 9, f"='FIGHT PRICING'!U{source_row}", fmt["pct_link"], record.get("position_fraction", 0))
+        dashboard.write_formula(row_index, 10, f"='FIGHT PRICING'!V{source_row}", fmt["money_link"], record.get("position_dollars", 0))
+        dashboard.write_formula(row_index, 11, f"='FIGHT PRICING'!Z{source_row}", fmt["link_text"], record.get("timing_reason") or record.get("why", ""))
     if analyses:
-        dashboard.autofilter(7, 0, 7 + len(analyses), 7)
-    dashboard.merge_range(10 + len(analyses), 0, 11 + len(analyses), 7, "READ THE BOARD LEFT TO RIGHT: the model creates a statistical fair probability; the live ask is the executable entry price; net edge subtracts the cost buffer; BET requires sufficient edge and UFC experience; position size is quarter Kelly subject to fight and card caps.", fmt["note"])
+        dashboard.autofilter(7, 0, 7 + len(analyses), 11)
+    dashboard.merge_range(10 + len(analyses), 0, 11 + len(analyses), 11, "READ LEFT TO RIGHT: model fair value is translated into model odds; entry ask is the executable Polymarket price; net edge subtracts the cost buffer; ENTER NOW means the ask is at or below the maximum buy price; capital equals quarter Kelly × data reliability, capped at 5% per fight and then scaled to the card limit.", fmt["note"])
 
     # Detailed model math and a worked example.
     guide = workbook.add_worksheet("MODEL GUIDE")
@@ -298,7 +343,7 @@ def build_excel(
         ("Calibration", f"P(A) = logistic({bundle['calibration_slope']:.3f} × logit(raw P(A))). Calibration maps raw scores to observed frequencies."),
         ("Trade selection", "Compare both fighters' model probabilities with their executable asks and select the larger net edge."),
         ("Decision", "BET only if net edge and minimum-experience requirements both pass."),
-        ("Sizing", "Full Kelly estimates the growth-optimal fraction; quarter Kelly and portfolio caps reduce volatility."),
+        ("Sizing", "Full Kelly measures edge versus payout. Quarter Kelly, a UFC-sample reliability factor, a 5% per-fight cap and the card cap reduce model-error and concentration risk."),
     ]
     for row, (step, explanation) in enumerate(pipeline, start=8):
         guide.write(row, 0, row - 7, fmt["label"])
@@ -314,32 +359,70 @@ def build_excel(
     model_p = safe_float(example.get("model_probability"))
     ask = safe_float(example.get("live_ask"))
     edge = safe_float(example.get("net_edge"))
-    full_kelly = max(0, edge / max(1e-9, 1 - ask - cost_buffer)) if np.isfinite(edge) and np.isfinite(ask) else np.nan
+    effective_entry = safe_float(example.get("effective_entry"), ask + cost_buffer)
+    gross_edge = safe_float(example.get("gross_edge"), model_p - ask)
+    full_kelly = safe_float(example.get("full_kelly"), max(0, edge / max(1e-9, 1 - effective_entry)) if np.isfinite(edge) else np.nan)
+    reliability = safe_float(example.get("data_reliability"), min(1, safe_float(example.get("experience"), 0) / max(1, reliability_fights)))
+    uncapped_risk = safe_float(example.get("uncapped_position_fraction"), full_kelly * kelly_fraction * reliability)
+    final_risk = safe_float(example.get("position_fraction"), min(max_position_pct, uncapped_risk))
     worked = [
         ("Model fair probability", model_p, "pct", "Calibrated probability for the selected trade side"),
-        ("Executable live ask", ask, "pct", "Current price required to enter"),
+        ("Model fair odds", safe_float(example.get("model_odds")), "odds", "American-odds translation of model fair probability"),
+        ("Executable entry ask", ask, "pct", "Lowest current Polymarket ask required to enter"),
+        ("Entry odds", safe_float(example.get("entry_odds", example.get("american_odds"))), "odds", "American-odds translation of the entry ask"),
+        ("Gross value gap", gross_edge, "pct", "Model fair − entry ask"),
         ("Cost buffer", cost_buffer, "pct", "Spread / fee / slippage allowance"),
-        ("Net edge", edge, "pct", "Model fair − live ask − cost buffer"),
-        ("Full Kelly", full_kelly, "pct", "Net edge ÷ (1 − live ask − cost buffer)"),
-        ("Quarter Kelly", full_kelly * 0.25 if np.isfinite(full_kelly) else np.nan, "pct", "Full Kelly × 25%"),
-        ("Actual position", safe_float(example.get("position_dollars")), "money", "Quarter Kelly after fight and card caps"),
-        ("Exit target", safe_float(example.get("exit_target")), "pct", "Ask + convergence scenario × (fair − ask)"),
+        ("Effective entry", effective_entry, "pct", "Entry ask + cost buffer"),
+        ("Net edge", edge, "pct", "Model fair − effective entry"),
+        ("Maximum buy price", safe_float(example.get("max_entry_price")), "pct", "Model fair − cost buffer − minimum required edge"),
+        ("Full Kelly", full_kelly, "pct", "Net edge ÷ (1 − effective entry)"),
+        ("Fractional Kelly", full_kelly * kelly_fraction if np.isfinite(full_kelly) else np.nan, "pct", f"Full Kelly × {kelly_fraction:.0%}"),
+        ("Data reliability", reliability, "pct", f"MIN(100%, lower-experience prior fights ÷ {reliability_fights})"),
+        ("Uncapped risk", uncapped_risk, "pct", "Fractional Kelly × data reliability"),
+        ("Final risk", final_risk, "pct", "MIN(uncapped risk, 5% per-fight cap) × portfolio scale"),
+        ("Actual position", safe_float(example.get("position_dollars")), "money", "Bankroll × final risk"),
+        ("Expected P&L", safe_float(example.get("expected_profit")), "money", "Position × (model fair ÷ effective entry − 1)"),
+        ("Entry timing", example.get("timing_signal", ""), "text", "ENTER NOW only when the ask is at or below the maximum buy price"),
     ]
     for col, label in enumerate(["", "Metric", "Value", "Interpretation"]):
         guide.write(23, col, label, fmt["header"])
     for row, (label, value, kind, note) in enumerate(worked, start=24):
         guide.write(row, 0, row - 23, fmt["label"])
         guide.write(row, 1, label, fmt["label"])
-        if np.isfinite(value):
+        if kind == "text":
+            guide.write(row, 2, value, fmt["text"])
+        elif np.isfinite(safe_float(value)):
             guide.write_number(row, 2, value, fmt[kind])
         else:
             guide.write_blank(row, 2, None, fmt[kind])
         guide.merge_range(row, 3, row, 7, note, fmt["wrap"])
         guide.set_row(row, 28)
-    guide.merge_range("A34:H34", "5 // PRICE DISCOVERY AND PRE-FIGHT EXIT", fmt["section"])
-    guide.merge_range("A35:H35", "Gap closed today = (Current midpoint − 8 AM price) ÷ (Model fair value − 8 AM price)", fmt["formula_box"])
-    guide.merge_range("A36:H36", "Position capture = (Executable bid − Recorded entry) ÷ (Model fair value − Recorded entry)", fmt["formula_box"])
-    guide.merge_range("A37:H39", "The convergence idea is tested, not assumed. The live executable bid determines what can actually be realized before the fight. SELL requires both a positive minimum return and sufficient observed gap capture; HOLD means statistical value remains; REVIEW flags a material drawdown. A prediction market can move away from model fair value, and convergence is never guaranteed.", fmt["note"])
+    guide.merge_range("A43:H43", "5 // EXACT POSITION-SIZING EQUATION", fmt["section"])
+    guide.merge_range("A44:H44", "Effective entry = ask + cost buffer; net edge = model fair − effective entry", fmt["formula_box"])
+    guide.merge_range("A45:H45", "Full Kelly = net edge ÷ (1 − effective entry)", fmt["formula_box"])
+    guide.merge_range("A46:H46", "Final risk % = MIN(5%, full Kelly × 25% × MIN(100%, prior fights ÷ 8)) × portfolio scale", fmt["formula_box"])
+    guide.merge_range("A48:H48", "6 // PRICE DISCOVERY AND PRE-FIGHT EXIT", fmt["section"])
+    guide.merge_range("A49:H49", "Gap closed today = (Current midpoint − 8 AM price) ÷ (Model fair value − 8 AM price)", fmt["formula_box"])
+    guide.merge_range("A50:H50", "Position capture = (Executable bid − recorded entry) ÷ (model fair value − recorded entry)", fmt["formula_box"])
+    guide.merge_range("A51:H53", "The convergence idea is measured, not assumed. The executable bid determines what can actually be realized before the fight. SELL requires both a positive minimum return and sufficient observed gap capture; HOLD means statistical value remains; REVIEW flags a material drawdown. Prediction-market prices can move away from model fair value, so convergence is never guaranteed.", fmt["note"])
+    guide.merge_range("A55:H55", "7 // FEATURE IMPORTANCE — HOW THE MODEL USES 100%", fmt["section"])
+    guide.merge_range("A56:H57", "These percentages are global gradient-boosting feature importance, not fixed linear weights. The 200 trees apply different thresholds and interactions for each matchup. Local Probability Impact on the FEATURE INPUTS tab shows which factors moved one specific fight; the calibrated probability is the result of all trees, order symmetry and calibration.", fmt["note"])
+    for col, label in enumerate(["Factor", "Importance", "Plain-English role"]):
+        guide.write(58, col, label, fmt["header"])
+    importance_notes = {
+        "Age advantage": "Age difference at the pre-fight snapshot",
+        "Record diff": "Smoothed UFC win-rate difference",
+        "Elo diff": "Opponent-adjusted strength difference",
+        "Strike diff": "Opponent-adjusted significant-strike margin",
+        "Control diff": "Opponent-adjusted control-time margin",
+        "TD diff": "Opponent-adjusted takedown margin",
+        "Reach diff": "Listed reach difference",
+        "Recent diff": "Win rate across the last five eligible UFC fights",
+    }
+    for row, (factor, value) in enumerate(sorted(bundle["importance"].items(), key=lambda item: item[1], reverse=True), start=59):
+        guide.write(row, 0, factor.replace(" diff", ""), fmt["text"])
+        guide.write_number(row, 1, value, fmt["pct"])
+        guide.merge_range(row, 2, row, 7, importance_notes.get(factor, "Model input"), fmt["wrap"])
 
     feature_rows = _raw_feature_rows(analyses)
     _table_sheet(workbook, fmt, "FEATURE INPUTS", "UFC EDGE — RAW FEATURE INPUTS", "All pre-fight values fed to the model; differences are Fighter A minus Fighter B except age advantage", [
@@ -468,7 +551,10 @@ def build_excel(
     _table_sheet(workbook, fmt, "TRACK RECORD", "UFC EDGE — MODEL TRACK RECORD", "Every recorded BET at its original entry; open positions use the executable bid and completed positions use the official result", [
         ("Entry UTC", "entry_timestamp_utc", 23, "text"), ("Event", "event", 17, "text"),
         ("Fight", "fight", 34, "text"), ("Bet Taken", "pick", 22, "text"),
-        ("Stake", "position_dollars", 13, "money"), ("Entry", "entry_price", 11, "pct"),
+        ("Model Fair", "model_probability", 12, "pct"), ("Model Odds", "model_odds", 12, "odds"),
+        ("Entry", "entry_price", 11, "pct"), ("Entry Odds", "entry_odds", 12, "odds"),
+        ("Net Edge", "net_edge", 12, "pct"), ("Entry Timing", "timing_signal", 16, "text"),
+        ("Risk %", "position_fraction", 11, "pct"), ("Stake", "position_dollars", 13, "money"),
         ("Current / Final", "current_final_price", 14, "pct"), ("Sell Target", "target_price", 13, "pct"),
         ("Target Progress", "target_progress", 15, "pct"), ("Net Return", "effective_return", 13, "pct"),
         ("Net P&L", "effective_pnl", 13, "money"), ("Status", "track_status", 12, "text"),
@@ -479,9 +565,12 @@ def build_excel(
     _table_sheet(workbook, fmt, "PREDICTION LOG", "UFC EDGE — PREDICTION LOG", "Entries are recorded before results; completed rows are graded as wins or losses", [
         ("Timestamp UTC", "timestamp_utc", 23, "text"), ("Event Date", "event_date", 14, "date"),
         ("Event", "event", 19, "text"), ("Fighter A", "fighter_a", 22, "text"), ("Fighter B", "fighter_b", 22, "text"),
-        ("Pick", "pick", 22, "text"), ("Model P", "model_probability", 12, "pct"),
-        ("Market Price", "market_probability", 12, "pct"), ("Net Edge", "net_edge", 12, "pct"),
-        ("Decision", "action", 12, "text"), ("Position $", "position_dollars", 13, "money"),
+        ("Pick", "pick", 22, "text"), ("Model P", "model_probability", 12, "pct"), ("Model Odds", "model_odds", 12, "odds"),
+        ("Entry Price", "market_probability", 12, "pct"), ("Entry Odds", "entry_odds", 12, "odds"),
+        ("Gross Gap", "gross_edge", 12, "pct"), ("Net Edge", "net_edge", 12, "pct"),
+        ("Full Kelly", "full_kelly", 12, "pct"), ("Data Reliability", "data_reliability", 15, "pct"),
+        ("Risk %", "position_fraction", 11, "pct"), ("Decision", "action", 12, "text"),
+        ("Entry Timing", "timing_signal", 16, "text"), ("Position $", "position_dollars", 13, "money"),
         ("Status", "status", 12, "text"), ("Winner", "winner", 22, "text"),
         ("Outcome", "outcome", 12, "text"), ("P&L", "pnl", 13, "money"), ("Model Version", "model_version", 18, "text"),
         ("Entry Source", "entry_source", 34, "text"), ("Decision Reason", "decision_reason", 46, "wrap"),
@@ -537,6 +626,12 @@ def build_excel(
         {"field":"Reach", "unit":"inches", "meaning":"Listed reach", "model_use":"Reach difference"},
         {"field":"Age", "unit":"years", "meaning":"Age at the model snapshot", "model_use":"Age advantage"},
         {"field":"Market price", "unit":"probability", "meaning":"Executable Polymarket ask at the recorded entry", "model_use":"Net edge and settlement P&L"},
+        {"field":"Model odds", "unit":"American odds", "meaning":"American-odds translation of the model fair probability", "model_use":"Makes model and market prices directly comparable"},
+        {"field":"Effective entry", "unit":"probability", "meaning":"Executable ask plus the configured cost buffer", "model_use":"Conservative edge and Kelly denominator"},
+        {"field":"Full Kelly", "unit":"% of bankroll", "meaning":"Net edge divided by one minus effective entry", "model_use":"Growth-optimal reference before risk reductions"},
+        {"field":"Data reliability", "unit":"percentage", "meaning":f"Lower-experience prior UFC fights divided by {reliability_fights}, capped at 100%", "model_use":"Reduces capital when UFC history is thin"},
+        {"field":"Final risk", "unit":"% of bankroll", "meaning":"Quarter Kelly times data reliability, capped at 5%, then card-scaled", "model_use":"Determines position dollars"},
+        {"field":"Maximum buy", "unit":"probability", "meaning":"Model fair minus cost buffer minus minimum net edge", "model_use":"ENTER NOW only when live ask is at or below this price"},
     ]
     _table_sheet(workbook, fmt, "DATA DICTIONARY", "UFC EDGE — DATA DICTIONARY", "Plain-English definitions for the raw model fields", [
         ("Field", "field", 25, "text"), ("Unit", "unit", 20, "text"),
@@ -554,8 +649,10 @@ def build_excel(
         checks.write(3, col, label, fmt["header"])
     check_rows = [
         ("Total card exposure", card_risk / bankroll if bankroll else np.nan, max_card_exposure, "pct", "Must not exceed configured cap"),
+        ("Maximum single-fight risk", max([safe_float(r.get("position_fraction"), 0) for r in analyses], default=0), max_position_pct, "pct", "No fight can exceed 1/20 of bankroll"),
         ("Probability range", min([min(r["probability_a"], r["probability_b"]) for r in analyses], default=np.nan), 0, "pct", "All probabilities must be at least zero"),
         ("Probability sums", max([abs(r["probability_a"] + r["probability_b"] - 1) for r in analyses], default=np.nan), 0.000001, "pct", "A and B probabilities must sum to 100%"),
+        ("Feature importance sum", sum(safe_float(value, 0) for value in bundle["importance"].values()), 1, "pct", "Global feature importance should sum to 100%"),
         ("Fights with live asks", sum(np.isfinite(safe_float(r.get("live_ask"))) for r in analyses), len(analyses), "int", "Shows market coverage for the selected card"),
         ("Holdout sample size", bundle["metrics"]["holdout_fights"], 500, "int", "Evaluation should use a material unseen sample"),
     ]
@@ -567,7 +664,12 @@ def build_excel(
         else:
             checks.write_blank(row, 1, None, fmt[kind])
         checks.write_number(row, 2, requirement, fmt[kind])
-        if label in {"Total card exposure", "Probability range", "Probability sums"}:
+        if label == "Feature importance sum":
+            difference = safe_float(observed) - requirement
+            checks.write_formula(row, 3, f"=B{excel_row}-C{excel_row}", fmt["pct_formula"], difference)
+            status = "PASS" if abs(difference) <= 0.000001 else "REVIEW"
+            checks.write_formula(row, 4, f'=IF(ABS(D{excel_row})<=0.000001,"PASS","REVIEW")', fmt["pass"] if status == "PASS" else fmt["review"], status)
+        elif label in {"Total card exposure", "Maximum single-fight risk", "Probability range", "Probability sums"}:
             difference = safe_float(observed) - requirement
             checks.write_formula(row, 3, f"=B{excel_row}-C{excel_row}", fmt["pct_formula"] if kind == "pct" else fmt["num"], difference)
             condition = "<=" if label != "Probability range" else ">="

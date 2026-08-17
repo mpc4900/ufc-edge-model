@@ -22,10 +22,12 @@ import model_engine as engine
 # Attribute binding avoids a hard startup failure when Streamlit reloads
 # app.py a few seconds before model_engine.py during a GitHub redeploy.
 analyze_card = engine.analyze_card
+binary_position_sizing = engine.binary_position_sizing
 canonical_name = engine.canonical_name
 discover_card = engine.discover_card
 discover_event_options = engine.discover_event_options
 feature_vector = engine.feature_vector
+entry_timing = engine.entry_timing
 fetch_completed_results_for_log = engine.fetch_completed_results_for_log
 fetch_market_rows = engine.fetch_market_rows
 grade_prediction_log = engine.grade_prediction_log
@@ -104,6 +106,16 @@ st.set_page_config(page_title="UFC Edge Ledger", page_icon="🥊", layout="wide"
 def pct(value, digits=1):
     value = safe_float(value)
     return "—" if not np.isfinite(value) else f"{value:.{digits}%}"
+
+
+def finite_or(value, fallback):
+    number = safe_float(value)
+    return number if np.isfinite(number) else fallback
+
+
+def text_or(value, fallback=""):
+    text = str(value or "").strip()
+    return fallback if text.lower() in {"", "nan", "none"} else text
 
 
 def money(value, signed=False):
@@ -267,12 +279,20 @@ def record_raw_inputs(record, bundle, fighters):
     return experience, raw_inputs, sorted(drivers, key=lambda row: abs(row["impact_pick"]), reverse=True)
 
 
-def analyses_from_log(frame, bundle, fighters):
+def analyses_from_log(frame, bundle, fighters, bankroll=10_000, cost_buffer=0.02, min_edge=0.03, min_prior_fights=3):
     rows = []
     for record in frame.to_dict("records"):
         experience, raw_inputs, drivers = record_raw_inputs(record, bundle, fighters)
         price = safe_float(record.get("market_probability"))
         model_p = safe_float(record.get("model_probability"))
+        sizing = binary_position_sizing(
+            model_p, price, safe_float(record.get("bankroll_at_entry"), bankroll), experience,
+            cost_buffer=cost_buffer,
+        )
+        timing = entry_timing(
+            model_p, price, cost_buffer=cost_buffer, min_edge=min_edge,
+            experience=experience, min_prior_fights=min_prior_fights,
+        )
         rows.append({
             "event": record.get("event", ""), "event_date": record.get("event_date", ""),
             "fighter_a": record.get("fighter_a", ""), "fighter_b": record.get("fighter_b", ""),
@@ -286,6 +306,22 @@ def analyses_from_log(frame, bundle, fighters):
             "scenario_return": np.nan, "american_odds": price_to_american(price),
             "net_edge": safe_float(record.get("net_edge")), "action": record.get("action", "NO BET"),
             "position_dollars": safe_float(record.get("position_dollars"), 0), "experience": experience,
+            "model_odds": finite_or(record.get("model_odds"), price_to_american(model_p)),
+            "entry_odds": finite_or(record.get("entry_odds"), price_to_american(price)),
+            "effective_entry": finite_or(record.get("effective_entry"), sizing["effective_entry"]),
+            "gross_edge": finite_or(record.get("gross_edge"), sizing["gross_edge"]),
+            "full_kelly": finite_or(record.get("full_kelly"), sizing["full_kelly"]),
+            "kelly_fraction": finite_or(record.get("kelly_fraction"), sizing["kelly_fraction"]),
+            "data_reliability": finite_or(record.get("data_reliability"), sizing["data_reliability"]),
+            "uncapped_position_fraction": finite_or(record.get("uncapped_position_fraction"), sizing["uncapped_position_fraction"]),
+            "position_fraction": finite_or(record.get("position_fraction"), sizing["position_fraction"]),
+            "portfolio_scale": finite_or(record.get("portfolio_scale"), 1.0),
+            "expected_profit": finite_or(record.get("expected_profit"), sizing["expected_profit"]),
+            "max_entry_price": finite_or(record.get("max_entry_price"), timing["max_entry_price"]),
+            "timing_signal": text_or(record.get("timing_signal"), timing["timing_signal"]),
+            "timing_reason": text_or(record.get("timing_reason"), timing["timing_reason"]),
+            "hours_to_event": finite_or(record.get("hours_to_event"), timing["hours_to_event"]),
+            "bankroll_at_entry": finite_or(record.get("bankroll_at_entry"), bankroll),
             "why": record.get("decision_reason", ""), "drivers": drivers[:3], "raw_inputs": raw_inputs,
             "research_shift": 0, "market_source": record.get("entry_source", ""),
             "market_url": record.get("entry_market_url", ""), "market_timestamp": record.get("entry_timestamp_utc", ""),
@@ -317,18 +353,20 @@ def bets_table(frame):
         return
     bets["Fight"] = bets["fighter_a"] + " vs " + bets["fighter_b"]
     bets["Bet"] = bets["pick"]
-    bets["Entry"] = bets["entry_price"]
-    bets["Odds"] = bets["entry_price"].map(odds)
+    bets["Model odds"] = bets["model_probability"].map(odds)
+    bets["Entry odds"] = bets["entry_price"].map(odds)
+    bets["Edge"] = bets["net_edge"]
     bets["Stake"] = bets["position_dollars"]
     bets["Result"] = bets["outcome"].where(bets["outcome"].astype(str).str.strip().ne(""), bets["status"])
     bets["P&L"] = bets["pnl"]
     bets["Why"] = bets["decision_reason"]
+    bets["Timing"] = bets.get("timing_signal", pd.Series("RECORDED", index=bets.index)).map(lambda value: text_or(value, "RECORDED"))
     bets["Price source"] = bets["entry_source"]
     st.dataframe(
-        bets[["Fight", "Bet", "Entry", "Odds", "Stake", "Result", "P&L", "Price source", "Why"]],
+        bets[["Fight", "Bet", "Model odds", "Entry odds", "Edge", "Stake", "Timing", "Result", "P&L", "Price source", "Why"]],
         width="stretch", hide_index=True,
         column_config={
-            "Entry": st.column_config.NumberColumn("Polymarket entry", format="percent"),
+            "Edge": st.column_config.NumberColumn("Net edge", format="percent"),
             "Stake": st.column_config.NumberColumn("Capital", format="dollar"),
             "P&L": st.column_config.NumberColumn("Net P&L", format="dollar"),
             "Price source": st.column_config.TextColumn(width="medium"),
@@ -344,6 +382,17 @@ def math_detail(record, bundle, fighters):
     edge = safe_float(record.get("net_edge"))
     pnl_value = safe_float(record.get("pnl"), 0)
     stake = safe_float(record.get("position_dollars"), 0)
+    effective_entry = finite_or(record.get("effective_entry"), entry + 0.02)
+    gross_edge = finite_or(record.get("gross_edge"), model_p - entry)
+    full_kelly = finite_or(record.get("full_kelly"), max(0, edge / max(1e-9, 1 - effective_entry)))
+    fractional_kelly = full_kelly * finite_or(record.get("kelly_fraction"), 0.25)
+    reliability = finite_or(record.get("data_reliability"), min(1, experience / 8))
+    uncapped_fraction = finite_or(record.get("uncapped_position_fraction"), fractional_kelly * reliability)
+    bankroll_at_entry = finite_or(record.get("bankroll_at_entry"), 10_100)
+    final_fraction = finite_or(record.get("position_fraction"), stake / bankroll_at_entry if bankroll_at_entry else 0)
+    max_entry = finite_or(record.get("max_entry_price"), model_p - 0.02 - 0.03)
+    timing_signal = text_or(record.get("timing_signal"), "ENTER NOW" if entry <= max_entry else "WAIT")
+    timing_reason = text_or(record.get("timing_reason"), f"Maximum buy price is {pct(max_entry)}.")
     result_formula = (
         f"{money(stake)} × (1 ÷ {entry:.1%} − 1) = {money(pnl_value, signed=True)}"
         if record.get("outcome") == "WIN" and 0 < entry < 1
@@ -351,13 +400,17 @@ def math_detail(record, bundle, fighters):
         else "No capital was deployed."
     )
     st.markdown(
-        f"<section class='math-panel'><div><span>MODEL FAIR VALUE</span><b>{pct(model_p)}</b></div>"
-        f"<div><span>POLYMARKET ENTRY</span><b>{pct(entry)}</b></div><div><span>COST BUFFER</span><b>2.0%</b></div>"
-        f"<div><span>NET EDGE</span><b>{pct(edge)}</b></div></section>", unsafe_allow_html=True,
+        f"<section class='math-panel'><div><span>MODEL FAIR ODDS</span><b>{escape(odds(model_p))}</b></div>"
+        f"<div><span>POLYMARKET ENTRY ODDS</span><b>{escape(odds(entry))}</b></div><div><span>GROSS VALUE GAP</span><b>{pct(gross_edge)}</b></div>"
+        f"<div><span>NET EDGE AFTER COSTS</span><b>{pct(edge)}</b></div></section>", unsafe_allow_html=True,
     )
     st.markdown(
-        f"<div class='equation'>{pct(model_p)} fair value − {pct(entry)} entry − 2.0% cost buffer = "
-        f"<strong>{pct(edge)} net edge</strong><br>{escape(result_formula)}</div>", unsafe_allow_html=True,
+        f"<div class='equation'><strong>PRICE</strong> &nbsp; {pct(model_p)} model fair − {pct(entry)} entry = {pct(gross_edge)} gross gap; "
+        f"{pct(gross_edge)} − 2.0% cost buffer = <strong>{pct(edge)} net edge</strong><br>"
+        f"<strong>SIZE</strong> &nbsp; Full Kelly = {pct(edge)} ÷ (1 − {pct(effective_entry)}) = {pct(full_kelly)}; "
+        f"{pct(full_kelly)} × 25% fractional Kelly × {pct(reliability)} data reliability = {pct(uncapped_fraction)}; "
+        f"final risk = min({pct(uncapped_fraction)}, 5.0% per-fight cap) × portfolio scale = <strong>{pct(final_fraction)}</strong><br>"
+        f"<strong>WHEN</strong> &nbsp; {escape(timing_signal)} — {escape(timing_reason)}<br>{escape(result_formula)}</div>", unsafe_allow_html=True,
     )
     driver_frame = pd.DataFrame([{"Factor": item["factor"], "Raw difference": item["value"], "Probability impact": item["impact_pick"]} for item in drivers])
     left, right = st.columns([1.05, 1.35])
@@ -425,10 +478,16 @@ def live_event_board(option, bankroll, min_edge, cost_buffer, min_fights, max_ca
                 "unrealized_return": unrealized_return,
                 "unrealized_pnl": stake * unrealized_return if np.isfinite(unrealized_return) else np.nan,
                 "signal": signal,
+                "fight": f"{row['fighter_a']} vs {row['fighter_b']}",
+                "trade_side": row["trade_side"], "entry_price": entry,
+                "morning_price": entry, "current_mid": np.nanmean([bid, safe_float(row.get("live_ask"))]),
+                "fair_value": row["model_probability"], "gap_closed": progress,
+                "position_dollars": stake, "reason": row.get("timing_reason", row.get("why", "")),
+                "hours_to_event": row.get("hours_to_event"),
             })
         if marks:
-            mark_prediction_log(STATE_DIR, marks)
-        update_market_history(STATE_DIR, current)
+            live_log = mark_prediction_log(STATE_DIR, marks)
+        market_history = update_market_history(STATE_DIR, current)
         elapsed = time.perf_counter() - started
         refreshed = datetime.now(ZoneInfo("America/New_York")).strftime("%b %-d, %-I:%M:%S %p ET")
         matched = sum(np.isfinite(safe_float(row.get("live_ask"))) for row in current)
@@ -440,17 +499,20 @@ def live_event_board(option, bankroll, min_edge, cost_buffer, min_fights, max_ca
         )
         live = pd.DataFrame([{
             "Fight": f"{row['fighter_a']} vs {row['fighter_b']}",
-            "Position": row["trade_side"], "Model fair value": row["model_probability"],
-            "Polymarket ask": row["live_ask"], "Net edge": row["net_edge"],
-            "Decision": row["action"], "Capital": row["position_dollars"],
+            "Position": row["trade_side"],
+            "Model odds": odds(row["model_probability"]),
+            "Entry odds": odds(row["live_ask"]),
+            "Net edge": row["net_edge"], "Max buy": row.get("max_entry_price"),
+            "When": row.get("timing_signal", ""), "Decision": row["action"],
+            "Risk %": row.get("position_fraction", 0), "Capital": row["position_dollars"],
             "Reason": row["why"], "Market": row.get("market_url", ""),
         } for row in current])
         st.dataframe(
             live, width="stretch", hide_index=True,
             column_config={
-                "Model fair value": st.column_config.NumberColumn(format="percent"),
-                "Polymarket ask": st.column_config.NumberColumn(format="percent"),
                 "Net edge": st.column_config.NumberColumn(format="percent"),
+                "Max buy": st.column_config.NumberColumn(format="percent"),
+                "Risk %": st.column_config.NumberColumn(format="percent"),
                 "Capital": st.column_config.NumberColumn(format="dollar"),
                 "Reason": st.column_config.TextColumn(width="large"),
                 "Market": st.column_config.LinkColumn("Polymarket"),
@@ -458,6 +520,21 @@ def live_event_board(option, bankroll, min_edge, cost_buffer, min_fights, max_ca
         )
         if matched == 0:
             st.warning("No executable Polymarket order books matched this card. No position was recorded from substitute odds.")
+        event_name = current[0]["event"] if current else search
+        safe_name = re.sub(r"[^A-Za-z0-9]+", "_", str(event_name)).strip("_")[:60] or "UFC_Event"
+        report_bytes = build_excel(
+            current, bundle, live_log, bankroll, event_name,
+            cost_buffer=cost_buffer, min_edge=min_edge,
+            min_prior_fights=int(min_fights), max_card_exposure=max_card_exposure,
+            convergence_rows=marks, market_history=market_history, fighters=fighters,
+        )
+        st.download_button(
+            "Download current Excel report",
+            report_bytes,
+            file_name=f"UFC_Edge_{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"download-{key_suffix}",
+        )
     except Exception as exc:
         st.error(f"Live price refresh failed: {exc}")
 
@@ -534,9 +611,23 @@ if view == "EVENT":
             if len(bets):
                 selected_pick = st.selectbox("Review a position", list(bets.index), format_func=lambda idx: f"{bets.loc[idx, 'pick']} / {bets.loc[idx, 'fighter_a']} vs {bets.loc[idx, 'fighter_b']}")
                 math_detail(bets.loc[selected_pick].to_dict(), bundle, fighters)
-            event_analyses = analyses_from_log(selected_event["frame"], bundle, fighters)
-            excel_bytes = build_excel(event_analyses, bundle, log, bankroll, selected_event["event"], cost_buffer=cost_buffer, min_edge=min_edge, min_prior_fights=int(min_fights), max_card_exposure=max_card_exposure, fighters=fighters)
-            st.download_button("Download full Excel audit", excel_bytes, file_name="UFC_Edge_Model_Audit.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            event_analyses = analyses_from_log(
+                selected_event["frame"], bundle, fighters, bankroll=bankroll,
+                cost_buffer=cost_buffer, min_edge=min_edge, min_prior_fights=int(min_fights),
+            )
+            history_path = STATE_DIR / "market_history.csv"
+            market_history = pd.read_csv(history_path) if history_path.exists() else pd.DataFrame()
+            excel_bytes = build_excel(
+                event_analyses, bundle, log, bankroll, selected_event["event"],
+                cost_buffer=cost_buffer, min_edge=min_edge, min_prior_fights=int(min_fights),
+                max_card_exposure=max_card_exposure, market_history=market_history, fighters=fighters,
+            )
+            safe_name = re.sub(r"[^A-Za-z0-9]+", "_", selected_event["event"]).strip("_")[:60]
+            st.download_button(
+                "Download current Excel report", excel_bytes,
+                file_name=f"UFC_Edge_{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         else:
             option = selected["option"]
             bouts = option.get("bouts") or []

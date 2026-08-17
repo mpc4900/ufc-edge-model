@@ -290,6 +290,7 @@ def _active_polymarket_ufc_cards():
             group["bouts"].append({
                 "event": card_name,
                 "event_date": local_start.date().isoformat(),
+                "start_utc": start.to_pydatetime().isoformat(),
                 "fighter_a": outcomes[0],
                 "fighter_b": outcomes[1],
                 "winner": "",
@@ -667,10 +668,102 @@ def research_shift(texts, fighter_a, fighter_b):
     return float(np.clip((scores[fighter_a] - scores[fighter_b]) * 0.04, -0.04, 0.04))
 
 
+def binary_position_sizing(
+    probability,
+    price,
+    bankroll,
+    experience,
+    cost_buffer=0.02,
+    kelly_fraction=0.25,
+    max_position_pct=0.05,
+    reliability_fights=8,
+):
+    """Return the auditable fractional-Kelly sizing steps for a $1 contract."""
+    probability = safe_float(probability)
+    price = safe_float(price)
+    bankroll = max(0.0, safe_float(bankroll, 0.0))
+    experience = max(0.0, safe_float(experience, 0.0))
+    if not (0 < probability < 1 and 0 < price < 1):
+        return {
+            "effective_entry": np.nan,
+            "gross_edge": np.nan,
+            "net_edge": np.nan,
+            "full_kelly": 0.0,
+            "kelly_fraction": kelly_fraction,
+            "data_reliability": 0.0,
+            "uncapped_position_fraction": 0.0,
+            "position_fraction": 0.0,
+            "position_dollars": 0.0,
+            "max_position_pct": max_position_pct,
+            "expected_profit": np.nan,
+        }
+    effective_entry = min(0.999, price + cost_buffer)
+    gross_edge = probability - price
+    net_edge = probability - effective_entry
+    full_kelly = max(0.0, net_edge / max(1e-9, 1 - effective_entry))
+    data_reliability = min(1.0, experience / max(1.0, reliability_fights))
+    uncapped_fraction = full_kelly * kelly_fraction * data_reliability
+    position_fraction = min(max_position_pct, uncapped_fraction)
+    position_dollars = round(bankroll * position_fraction, 2)
+    expected_profit = position_dollars * (probability / effective_entry - 1)
+    return {
+        "effective_entry": effective_entry,
+        "gross_edge": gross_edge,
+        "net_edge": net_edge,
+        "full_kelly": full_kelly,
+        "kelly_fraction": kelly_fraction,
+        "data_reliability": data_reliability,
+        "uncapped_position_fraction": uncapped_fraction,
+        "position_fraction": position_fraction,
+        "position_dollars": position_dollars,
+        "max_position_pct": max_position_pct,
+        "expected_profit": expected_profit,
+    }
+
+
+def entry_timing(
+    probability,
+    price,
+    cost_buffer=0.02,
+    min_edge=0.03,
+    experience=0,
+    min_prior_fights=3,
+    start_utc="",
+):
+    """Return a price-driven entry signal and its exact maximum buy price."""
+    probability = safe_float(probability)
+    price = safe_float(price)
+    max_entry_price = probability - cost_buffer - min_edge if np.isfinite(probability) else np.nan
+    hours_to_event = np.nan
+    start = pd.to_datetime(start_utc, utc=True, errors="coerce")
+    if pd.notna(start):
+        hours_to_event = (start.to_pydatetime() - datetime.now(timezone.utc)).total_seconds() / 3600
+    if not (0 < price < 1):
+        signal = "WAIT FOR LIVE PRICE"
+        reason = "No executable ask is available."
+    elif experience < min_prior_fights:
+        signal = "PASS — THIN DATA"
+        reason = f"Only {int(experience)} prior UFC fights on the lower-experience side."
+    elif price <= max_entry_price:
+        signal = "ENTER NOW"
+        reason = f"Ask {price:.1%} is at or below the {max_entry_price:.1%} maximum entry."
+    else:
+        signal = "WAIT"
+        reason = f"Buy only at {max_entry_price:.1%} or lower; current ask is {price:.1%}."
+    if np.isfinite(hours_to_event):
+        reason += f" {max(0.0, hours_to_event):.0f} hours to scheduled start."
+    return {
+        "timing_signal": signal,
+        "timing_reason": reason,
+        "max_entry_price": max_entry_price,
+        "hours_to_event": hours_to_event,
+    }
+
+
 def analyze_card(card, market_rows, bundle, fighters, bankroll=10_000, research_texts=None,
                  min_edge=0.03, cost_buffer=0.02, kelly_fraction=0.25,
-                 max_position_pct=0.02, min_prior_fights=3, convergence=0.50,
-                 max_card_exposure=0.10, polymarket_only=True):
+                 max_position_pct=0.05, min_prior_fights=3, convergence=0.50,
+                 max_card_exposure=0.10, polymarket_only=True, reliability_fights=8):
     research_texts = research_texts or []
     analyses = []
     for bout in card:
@@ -692,10 +785,19 @@ def analyze_card(card, market_rows, bundle, fighters, bankroll=10_000, research_
             else:
                 pick, probability, price, edge = bout["fighter_b"], probability_b, market["price_b"], edge_b
                 source, market_url, market_timestamp, bid, pick_is_a = market["source_b"], market["url_b"], market["timestamp_b"], market["bid_b"], False
-            all_in = min(0.999, price + cost_buffer)
-            full_kelly = max(0, (probability - all_in) / max(1e-9, 1 - all_in))
+            sizing = binary_position_sizing(
+                probability, price, bankroll, experience,
+                cost_buffer=cost_buffer, kelly_fraction=kelly_fraction,
+                max_position_pct=max_position_pct, reliability_fights=reliability_fights,
+            )
+            edge = sizing["net_edge"]
             action = "BET" if edge >= min_edge and experience >= min_prior_fights else "NO BET"
-            position = round(bankroll * min(max_position_pct, kelly_fraction * full_kelly), 2) if action == "BET" else 0
+            position = sizing["position_dollars"] if action == "BET" else 0
+            timing = entry_timing(
+                probability, price, cost_buffer=cost_buffer, min_edge=min_edge,
+                experience=experience, min_prior_fights=min_prior_fights,
+                start_utc=bout.get("start_utc", ""),
+            )
             exit_target = min(probability, price + convergence * max(0, probability - price))
             scenario_move = exit_target - price
         else:
@@ -704,6 +806,16 @@ def analyze_card(card, market_rows, bundle, fighters, bankroll=10_000, research_
             probability = max(probability_a, probability_b)
             price, bid, edge, source, action, position = np.nan, np.nan, np.nan, "", "NO BET", 0
             market_url, market_timestamp, exit_target, scenario_move = "", "", np.nan, np.nan
+            sizing = binary_position_sizing(
+                probability, price, bankroll, experience,
+                cost_buffer=cost_buffer, kelly_fraction=kelly_fraction,
+                max_position_pct=max_position_pct, reliability_fights=reliability_fights,
+            )
+            timing = entry_timing(
+                probability, price, cost_buffer=cost_buffer, min_edge=min_edge,
+                experience=experience, min_prior_fights=min_prior_fights,
+                start_utc=bout.get("start_utc", ""),
+            )
         drivers = local_drivers(bundle, vector)
         for driver in drivers:
             driver["impact_pick"] = driver["impact_a"] if pick_is_a else -driver["impact_a"]
@@ -725,6 +837,22 @@ def analyze_card(card, market_rows, bundle, fighters, bankroll=10_000, research_
             "scenario_return": scenario_move / price if 0 < price < 1 and np.isfinite(scenario_move) else np.nan,
             "american_odds": price_to_american(price),
             "net_edge": edge, "action": action, "position_dollars": position,
+            "model_odds": price_to_american(probability),
+            "entry_odds": price_to_american(price),
+            "effective_entry": sizing["effective_entry"],
+            "gross_edge": sizing["gross_edge"],
+            "full_kelly": sizing["full_kelly"],
+            "kelly_fraction": sizing["kelly_fraction"],
+            "data_reliability": sizing["data_reliability"],
+            "uncapped_position_fraction": sizing["uncapped_position_fraction"],
+            "position_fraction": sizing["position_fraction"] if action == "BET" else 0,
+            "portfolio_scale": 1.0 if action == "BET" else 0.0,
+            "expected_profit": sizing["expected_profit"] if action == "BET" else 0.0,
+            "bankroll_at_entry": bankroll,
+            "max_entry_price": timing["max_entry_price"],
+            "timing_signal": timing["timing_signal"],
+            "timing_reason": timing["timing_reason"],
+            "hours_to_event": timing["hours_to_event"],
             "experience": experience, "why": why, "drivers": top,
             "raw_inputs": raw_inputs, "research_shift": shift, "market_source": source,
             "market_url": market_url, "market_timestamp": market_timestamp,
@@ -737,10 +865,14 @@ def analyze_card(card, market_rows, bundle, fighters, bankroll=10_000, research_
         for row in analyses:
             if row["action"] == "BET":
                 row["position_dollars"] = round(row["position_dollars"] * scale, 2)
+                row["position_fraction"] = row["position_dollars"] / bankroll if bankroll else 0.0
+                row["portfolio_scale"] = scale
+                row["expected_profit"] = row["expected_profit"] * scale
         rounded_total = sum(row["position_dollars"] for row in analyses if row["action"] == "BET")
         if rounded_total > exposure_cap:
             last_bet = next(row for row in reversed(analyses) if row["action"] == "BET")
             last_bet["position_dollars"] = round(last_bet["position_dollars"] - (rounded_total - exposure_cap), 2)
+            last_bet["position_fraction"] = last_bet["position_dollars"] / bankroll if bankroll else 0.0
     return analyses
 
 
@@ -753,6 +885,10 @@ LOG_COLUMNS = [
     "last_price_timestamp_utc", "live_bid", "live_ask", "target_price",
     "target_progress", "unrealized_return", "unrealized_pnl", "position_signal",
     "entry_source", "entry_market_url", "decision_reason", "result_source",
+    "model_odds", "effective_entry", "gross_edge", "full_kelly", "kelly_fraction",
+    "data_reliability", "uncapped_position_fraction", "position_fraction",
+    "portfolio_scale", "expected_profit", "max_entry_price", "timing_signal",
+    "timing_reason", "hours_to_event", "bankroll_at_entry",
 ]
 
 LOG_TEXT_COLUMNS = [
@@ -760,14 +896,17 @@ LOG_TEXT_COLUMNS = [
     "pick", "action", "entry_timestamp_utc", "status", "winner", "outcome",
     "settled_timestamp_utc", "exit_type", "closing_reason", "model_version",
     "last_price_timestamp_utc", "position_signal", "entry_source",
-    "entry_market_url", "decision_reason", "result_source",
+    "entry_market_url", "decision_reason", "result_source", "timing_signal", "timing_reason",
 ]
 
 LOG_NUMERIC_COLUMNS = [
     "model_probability", "market_probability", "net_edge", "position_dollars",
     "entry_price", "entry_odds", "potential_profit", "exit_price", "return_pct", "pnl",
     "live_bid", "live_ask", "target_price", "target_progress",
-    "unrealized_return", "unrealized_pnl",
+    "unrealized_return", "unrealized_pnl", "model_odds", "effective_entry", "gross_edge",
+    "full_kelly", "kelly_fraction", "data_reliability", "uncapped_position_fraction",
+    "position_fraction", "portfolio_scale", "expected_profit", "max_entry_price",
+    "hours_to_event", "bankroll_at_entry",
 ]
 
 MARKET_HISTORY_COLUMNS = [
@@ -1085,6 +1224,21 @@ def update_prediction_log(state_dir: Path, analyses):
             "entry_source": row.get("market_source", ""),
             "entry_market_url": row.get("market_url", ""),
             "decision_reason": row.get("why", ""), "result_source": "",
+            "model_odds": row.get("model_odds", price_to_american(row.get("model_probability"))),
+            "effective_entry": row.get("effective_entry", np.nan),
+            "gross_edge": row.get("gross_edge", np.nan),
+            "full_kelly": row.get("full_kelly", np.nan),
+            "kelly_fraction": row.get("kelly_fraction", np.nan),
+            "data_reliability": row.get("data_reliability", np.nan),
+            "uncapped_position_fraction": row.get("uncapped_position_fraction", np.nan),
+            "position_fraction": row.get("position_fraction", np.nan),
+            "portfolio_scale": row.get("portfolio_scale", np.nan),
+            "expected_profit": row.get("expected_profit", np.nan),
+            "max_entry_price": row.get("max_entry_price", np.nan),
+            "timing_signal": row.get("timing_signal", ""),
+            "timing_reason": row.get("timing_reason", ""),
+            "hours_to_event": row.get("hours_to_event", np.nan),
+            "bankroll_at_entry": row.get("bankroll_at_entry", np.nan),
         }
         completed = ((log.get("prediction_id", pd.Series(dtype=str)) == prediction_id) & (log.get("status", pd.Series(dtype=str)) == "COMPLETED")).any()
         if completed:
